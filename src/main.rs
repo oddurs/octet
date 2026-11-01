@@ -120,7 +120,7 @@ fn run_cli(args: Vec<String>) -> Result<()> {
     let (sliced_vec, start_off) =
         read_input_window(cfg.input_path.as_deref(), cfg.seek.as_deref(), cfg.length)?;
     let sliced = sliced_vec.as_slice();
-    let base_disp_offset = cfg.display_offset.unwrap_or(start_off);
+    let base_disp_offset = start_off.wrapping_add(cfg.display_offset.unwrap_or(0));
 
     // Code generation mode (`-i` / `--include` or `--lang`)
     if cfg.include_codegen {
@@ -157,10 +157,14 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    // Standard / Smart / Classic hex or radix dump
-    let default_cols = match cfg.radix {
-        Radix::Binary => 6,
-        Radix::Hex | Radix::Octal | Radix::Decimal => 16,
+    // Standard / Smart / Classic / Plain hex or radix dump
+    let default_cols = if cfg.style == ViewStyle::Plain {
+        30
+    } else {
+        match cfg.radix {
+            Radix::Binary => 6,
+            Radix::Hex | Radix::Octal | Radix::Decimal => 16,
+        }
     };
     let cols = cfg.cols.unwrap_or(default_cols);
     let default_group = match cfg.radix {

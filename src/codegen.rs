@@ -125,10 +125,9 @@ fn sanitize_identifier(raw: &str) -> String {
             s.push('_');
         }
     }
-    let trimmed = s.trim_matches('_');
-    if trimmed.is_empty() {
+    if s.chars().all(|c| c == '_') {
         String::from("octet_data")
     } else {
-        trimmed.to_owned()
+        s
     }
 }

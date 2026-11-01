@@ -155,16 +155,24 @@ pub fn analyze_buffer(data: &[u8], opts: &FormatOptions) -> AnalyzedBuffer {
             bytes: chunk.to_vec(),
         });
 
-        if opts.autoskip && chunk.len() == cols {
+        let can_autoskip = opts.autoskip
+            && chunk.len() == cols
+            && (opts.style != ViewStyle::Classic || chunk.iter().all(|&b| b == 0));
+        if can_autoskip {
             let mut repeat_end = i + 1;
             while repeat_end < raw_chunks.len() && raw_chunks[repeat_end].1 == chunk {
                 repeat_end += 1;
             }
-            let duplicate_count = repeat_end - (i + 1);
+            let elide_end = if opts.style == ViewStyle::Classic && repeat_end == raw_chunks.len() {
+                repeat_end.saturating_sub(1)
+            } else {
+                repeat_end
+            };
+            let duplicate_count = elide_end.saturating_sub(i + 1);
             if duplicate_count >= 2 {
                 let first_dup_idx = raw_chunks[i + 1].0;
                 let last_dup_idx =
-                    raw_chunks[repeat_end - 1].0 + raw_chunks[repeat_end - 1].1.len() - 1;
+                    raw_chunks[elide_end - 1].0 + raw_chunks[elide_end - 1].1.len() - 1;
                 let uniform_byte = if chunk.iter().all(|&b| b == chunk[0]) {
                     Some(chunk[0])
                 } else {
@@ -177,7 +185,7 @@ pub fn analyze_buffer(data: &[u8], opts: &FormatOptions) -> AnalyzedBuffer {
                     byte_count: duplicate_count * cols,
                     uniform_byte,
                 });
-                i = repeat_end;
+                i = elide_end;
                 continue;
             }
         }
@@ -208,6 +216,9 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
     }
 
     if data.is_empty() {
+        if opts.style == ViewStyle::Classic {
+            return String::new();
+        }
         let msg = opts
             .theme
             .paint("  (empty input: 0 bytes)", opts.theme.fg_muted, opts.color);
@@ -287,7 +298,11 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
 
 fn render_plain(data: &[u8], cols: usize, upper: bool) -> String {
     if data.is_empty() {
-        return String::new();
+        return if cols == 0 {
+            String::from("\n")
+        } else {
+            String::new()
+        };
     }
     let wrap = if cols == 0 { usize::MAX } else { cols };
     let mut out = String::with_capacity(data.len() * 2 + data.len() / wrap.max(1) + 2);
@@ -507,7 +522,7 @@ fn render_data_row(
     let show_mid_divider =
         cols >= 8 && opts.style != ViewStyle::Classic && mid_col.is_multiple_of(group_size);
 
-    let off_str = t.format_offset(offset, 8, opts.upper_hex, c);
+    let off_str = t.format_offset(offset, 8, false, c);
     if opts.style == ViewStyle::Classic {
         let _ = write!(out, "{off_str}: ");
     } else {
@@ -758,7 +773,11 @@ fn render_little_endian_hex(
     let groups = cols.div_ceil(group_size);
     for g in 0..groups {
         let g_start = g * group_size;
-        let g_end = (g_start + group_size).min(cols);
+        let g_end = if opts.style == ViewStyle::Classic {
+            g_start + group_size
+        } else {
+            (g_start + group_size).min(cols)
+        };
         if g > 0 {
             if show_mid_divider && g_start == mid_col {
                 let _ = write!(
@@ -770,10 +789,8 @@ fn render_little_endian_hex(
                 out.push(' ');
             }
         }
-        let valid_end = g_end.min(bytes.len());
-        if valid_end > g_start {
-            for col in (g_start..valid_end).rev() {
-                let byte = bytes[col];
+        for col in (g_start..g_end).rev() {
+            if let Some(&byte) = bytes.get(col) {
                 let abs_idx = start_index + col;
                 let class = analyzed
                     .classes
@@ -791,12 +808,7 @@ fn render_little_endian_hex(
                     opts.color,
                 );
                 let _ = write!(out, "{styled}");
-            }
-            for _ in valid_end..g_end {
-                let _ = write!(out, "  ");
-            }
-        } else {
-            for _ in g_start..g_end {
+            } else {
                 let _ = write!(out, "  ");
             }
         }

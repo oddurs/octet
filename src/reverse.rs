@@ -99,9 +99,11 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
             continue;
         }
 
-        // Isolate the data column before the glyph pane (`│` in octet, or two spaces in xxd).
+        // Isolate the data column before the glyph pane (`│` in octet, `|` in hexdump -C, or two spaces in xxd).
         let data_zone = if let Some((before_pipe, _)) = rest.split_once('│') {
             before_pipe
+        } else if let Some((before_ascii_pipe, _)) = rest.split_once("  |") {
+            before_ascii_pipe
         } else if let Some((before_gap, _)) = rest.split_once("  ") {
             before_gap
         } else {
