@@ -147,29 +147,52 @@ pub fn render_diff_ansi(
     theme: &Theme,
     color: bool,
 ) -> String {
+    let cols = cols.max(4);
     let mut out = String::new();
     let left_short = basename(left_label);
     let right_short = basename(right_label);
-    let inner_w = 88usize;
+    let side_w = 4 * cols + 2;
+    let table_w = 16 + 2 * side_w;
+    let inner_w = table_w.saturating_sub(2);
     let top_bar = format!("╭{}╮", "─".repeat(inner_w));
+    let mid_bar = format!("├{}┤", "─".repeat(inner_w));
     let bot_bar = format!("╰{}╯", "─".repeat(inner_w));
 
     let _ = writeln!(out, "{}", theme.paint(&top_bar, theme.border, color));
-    let summary = format!(
-        " ◈ BINARY DIFF · {left_short} ({} B) vs {right_short} ({} B) · {} Δ bytes in {} rows",
-        report.left_len, report.right_len, report.changed_bytes, report.changed_rows
-    );
-    let count = summary.chars().count();
-    let padded = if count >= inner_w {
-        summary.chars().take(inner_w).collect::<String>()
+    let max_len = report.left_len.max(report.right_len);
+    let similarity = if max_len == 0 {
+        100.0
     } else {
-        format!("{summary}{}", " ".repeat(inner_w - count))
+        ((max_len.saturating_sub(report.changed_bytes) as f64) / (max_len as f64)) * 100.0
     };
+    let summary = format!(
+        " ◈ BINARY DIFF  │  {} Δ bytes across {} changed rows  │  {similarity:.1}% identical",
+        report.changed_bytes, report.changed_rows
+    );
+    let padded = pad_diff_cell(&summary, inner_w);
     let _ = writeln!(
         out,
         "{}{}{}",
         theme.paint("│", theme.border, color),
         theme.paint_bold(&padded, theme.fg_primary, color),
+        theme.paint("│", theme.border, color),
+    );
+    let _ = writeln!(out, "{}", theme.paint(&mid_bar, theme.border, color));
+
+    let left_hdr = pad_diff_cell(&format!("⊖ {left_short} ({} B)", report.left_len), side_w);
+    let right_hdr = pad_diff_cell(
+        &format!("⊕ {right_short} ({} B)", report.right_len),
+        side_w.saturating_sub(1),
+    );
+    let _ = writeln!(
+        out,
+        "{}{} {} {}  {}  {}{}",
+        theme.paint("│", theme.border, color),
+        theme.paint_bold(" OFFSET", theme.fg_muted, color),
+        theme.paint("│", theme.border, color),
+        theme.paint_bold(&left_hdr, theme.diff_del, color),
+        theme.paint("│", theme.border, color),
+        theme.paint_bold(&right_hdr, theme.diff_add, color),
         theme.paint("│", theme.border, color),
     );
     let _ = writeln!(out, "{}", theme.paint(&bot_bar, theme.border, color));
@@ -182,9 +205,16 @@ pub fn render_diff_ansi(
                 byte_count,
             } => {
                 let off_str = theme.format_offset(*start_offset, 8, false, color);
-                let msg =
-                    format!("  ⋮   ⋯ {row_count} identical rows ({byte_count} bytes) unchanged ⋯");
-                let _ = writeln!(out, "{off_str}{}", theme.paint(&msg, theme.fg_muted, color));
+                let msg = pad_diff_cell(
+                    &format!(" ⋮ ⋯ {row_count} identical rows ({byte_count} bytes) unchanged ⋯"),
+                    table_w.saturating_sub(9),
+                );
+                let _ = writeln!(
+                    out,
+                    "{off_str}{}{}",
+                    theme.paint(&msg, theme.fg_muted, color),
+                    theme.paint("│", theme.border, color)
+                );
             }
             DiffRow::Data {
                 offset,
@@ -208,7 +238,31 @@ pub fn render_diff_ansi(
             }
         }
     }
+
+    let _ = writeln!(out, "{}", theme.paint(&top_bar, theme.border, color));
+    let footer_plain =
+        " Δ Modified Row   ⊖ Left / Removed Byte   ⊕ Right / Added Byte   · Unchanged";
+    let footer_padded = pad_diff_cell(footer_plain, inner_w);
+    let _ = writeln!(
+        out,
+        "{}{}{}",
+        theme.paint("│", theme.border, color),
+        theme.paint(&footer_padded, theme.fg_muted, color),
+        theme.paint("│", theme.border, color),
+    );
+    let _ = writeln!(out, "{}", theme.paint(&bot_bar, theme.border, color));
     out
+}
+
+fn pad_diff_cell(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count > width {
+        let mut clipped: String = s.chars().take(width.saturating_sub(1)).collect();
+        clipped.push('…');
+        clipped
+    } else {
+        format!("{s}{}", " ".repeat(width - count))
+    }
 }
 
 fn basename(path: &str) -> &str {

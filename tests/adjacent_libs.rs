@@ -6,7 +6,7 @@
 
 use octet::{
     ByteClass, ByteStats, FormatOptions, Radix, Theme, ValueInspection, ViewStyle, classify_slice,
-    compute_entropy, inspect_header, render_dump, reverse_dump,
+    compute_diff, compute_entropy, inspect_header, render_diff_ansi, render_dump, reverse_dump,
 };
 
 /// Models `hexyl`'s byte category invariants across all 256 single-byte values (`0x00..=0xFF`).
@@ -347,32 +347,54 @@ fn test_exhaustive_magic_header_corpus() {
 /// and multi-radix rendering across Hex, Binary, Octal, and Decimal.
 #[test]
 fn test_pretty_hex_structural_card_alignment_and_radices() {
-    let mut data = Vec::new();
-    data.extend_from_slice(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR");
-    data.extend_from_slice(&[0u8; 48]);
-    data.extend_from_slice("Hello 🦀 Octet!\n".as_bytes());
+    let mut data_with_hdr = Vec::new();
+    data_with_hdr.extend_from_slice(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR");
+    data_with_hdr.extend_from_slice(&[0u8; 48]);
+    data_with_hdr.extend_from_slice("Hello 🦀 Octet!\n".as_bytes());
 
-    for radix in [Radix::Hex, Radix::Binary, Radix::Octal, Radix::Decimal] {
-        let cols = if radix == Radix::Binary { 6 } else { 16 };
-        let group_size = if radix == Radix::Hex { 2 } else { 1 };
-        let opts = FormatOptions {
-            label: Some(String::from("alignment.bin")),
-            style: ViewStyle::Smart,
-            radix,
-            cols,
-            group_size,
-            color: false,
-            ..FormatOptions::default()
-        };
-        let rendered = render_dump(&data, &opts);
-        let line_widths: Vec<usize> = rendered.lines().map(|l| l.chars().count()).collect();
-        let expected_w = line_widths[0];
-        for (idx, &w) in line_widths.iter().enumerate() {
-            assert_eq!(
-                w, expected_w,
-                "Smart view line {idx} for radix {radix:?} had width {w}, expected uniform {expected_w}"
-            );
+    let data_no_hdr =
+        b"Arbitrary binary payload without a known magic header!\x00\xff\x01".to_vec();
+
+    for sample in [&data_with_hdr, &data_no_hdr] {
+        for radix in [Radix::Hex, Radix::Binary, Radix::Octal, Radix::Decimal] {
+            let cols = if radix == Radix::Binary { 6 } else { 16 };
+            let group_size = if radix == Radix::Hex { 2 } else { 1 };
+            let opts = FormatOptions {
+                label: Some(String::from("alignment.bin")),
+                style: ViewStyle::Smart,
+                radix,
+                cols,
+                group_size,
+                color: false,
+                ..FormatOptions::default()
+            };
+            let rendered = render_dump(sample, &opts);
+            assert!(rendered.contains("OFFSET"));
+            let line_widths: Vec<usize> = rendered.lines().map(|l| l.chars().count()).collect();
+            let expected_w = line_widths[0];
+            for (idx, &w) in line_widths.iter().enumerate() {
+                assert_eq!(
+                    w, expected_w,
+                    "Smart view line {idx} for radix {radix:?} had width {w}, expected uniform {expected_w}"
+                );
+            }
         }
+    }
+
+    // Also verify uniform character width across every row of binary diff output
+    let mut left = vec![0x41u8; 64];
+    left[0..8].copy_from_slice(b"OCTET_v1");
+    let mut right = left.clone();
+    right[0..8].copy_from_slice(b"OCTET_v2");
+    let report = compute_diff(&left, &right, 8, 0, true);
+    let diff_str = render_diff_ansi(&report, "v1.bin", "v2.bin", 8, &Theme::dark(), false);
+    let diff_widths: Vec<usize> = diff_str.lines().map(|l| l.chars().count()).collect();
+    let expected_diff_w = diff_widths[0];
+    for (idx, &w) in diff_widths.iter().enumerate() {
+        assert_eq!(
+            w, expected_diff_w,
+            "Diff view line {idx} had width {w}, expected uniform {expected_diff_w}"
+        );
     }
 }
 

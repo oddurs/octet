@@ -440,7 +440,102 @@ fn render_header_banner(
         t.paint("│", t.border, c),
     );
 
+    let mid_bar = format!("├{}┤", "─".repeat(inner_w));
+    let _ = writeln!(out, "{}", t.paint(&mid_bar, t.border, c));
+    render_column_ruler_row(out, opts, width);
     let _ = writeln!(out, "{}", t.paint(&bot_bar, t.border, c));
+}
+
+fn render_column_ruler_row(out: &mut String, opts: &FormatOptions, card_width: usize) {
+    let t = &opts.theme;
+    let c = opts.color;
+    let cols = opts.cols.max(1);
+    let group_size = effective_group_size(opts);
+    let mid_col = cols / 2;
+    let show_mid_divider =
+        cols >= 8 && opts.style != ViewStyle::Classic && mid_col.is_multiple_of(group_size);
+
+    let _ = write!(
+        out,
+        "{}{}",
+        t.paint("│", t.border, c),
+        t.paint_bold(" OFFSET  ", t.fg_muted, c)
+    );
+
+    if opts.little_endian && opts.radix == Radix::Hex && group_size > 1 {
+        let groups = cols.div_ceil(group_size);
+        for g in 0..groups {
+            let g_start = g * group_size;
+            let g_end = (g_start + group_size).min(cols);
+            if g > 0 {
+                if show_mid_divider && g_start == mid_col {
+                    let _ = write!(out, " {} ", t.paint("⋮", t.border, c));
+                } else {
+                    out.push(' ');
+                }
+            }
+            for col in (g_start..g_end).rev() {
+                let tok = if opts.upper_hex {
+                    format!("{col:02X}")
+                } else {
+                    format!("{col:02x}")
+                };
+                let _ = write!(out, "{}", t.paint(&tok, t.fg_muted, c));
+            }
+        }
+    } else {
+        for col in 0..cols {
+            if col > 0 {
+                if show_mid_divider && col == mid_col {
+                    let _ = write!(out, " {} ", t.paint("⋮", t.border, c));
+                } else if col % group_size == 0 {
+                    out.push(' ');
+                }
+            }
+            let tok = match opts.radix {
+                Radix::Hex => {
+                    if opts.upper_hex {
+                        format!("{col:02X}")
+                    } else {
+                        format!("{col:02x}")
+                    }
+                }
+                Radix::Binary => format!("  +{col:02x}   "),
+                Radix::Octal | Radix::Decimal => format!("+{col:02x}"),
+            };
+            let _ = write!(out, "{}", t.paint(&tok, t.fg_muted, c));
+        }
+    }
+
+    let _ = write!(out, "  {}", t.paint("│", t.border, c));
+    let mut glyph_ruler = String::with_capacity(cols);
+    for col in 0..cols {
+        let ch = char::from_digit((col & 0xf) as u32, 16).unwrap_or('0');
+        glyph_ruler.push(if opts.upper_hex {
+            ch.to_ascii_uppercase()
+        } else {
+            ch
+        });
+    }
+    let _ = write!(
+        out,
+        "{}{}",
+        t.paint(&glyph_ruler, t.fg_muted, c),
+        t.paint("│", t.border, c)
+    );
+
+    let core_w = compute_table_core_width(opts);
+    if card_width > core_w + 4 {
+        let rail_budget = card_width - core_w - 3;
+        let padded = pad_or_clip("CONTEXT / ANNOTATIONS", rail_budget);
+        let _ = write!(
+            out,
+            "  {}{}",
+            t.paint_bold(&padded, t.fg_muted, c),
+            t.paint("│", t.border, c)
+        );
+    }
+    let _ = writeln!(out);
 }
 
 fn style_banner_line1(padded: &str, t: &Theme, color: bool) -> String {
@@ -936,29 +1031,61 @@ fn render_annotation_footer(
             t.paint("│", t.border, c),
         );
     }
+    let mid = format!("├{}┤", "─".repeat(inner_w));
+    let _ = writeln!(out, "{}", t.paint(&mid, t.border, c));
+    render_legend_row(out, opts, inner_w);
     let _ = writeln!(out, "{}", t.paint(&bot, t.border, c));
 }
 
 fn render_legend_footer(out: &mut String, _stats: &ByteStats, opts: &FormatOptions, width: usize) {
     let t = &opts.theme;
     let c = opts.color;
-    let legend = format!(
-        "  {} {}   {} {}   {} {}   {} {}   {} {}   {} {}   {} {}",
-        t.paint("·", t.byte_null, c),
-        t.paint("Null", t.fg_muted, c),
-        t.paint("A", t.byte_ascii, c),
-        t.paint("ASCII", t.fg_muted, c),
-        t.paint("␣↵", t.byte_whitespace, c),
-        t.paint("Space", t.fg_muted, c),
-        t.paint("␁", t.byte_control, c),
-        t.paint("Control", t.fg_muted, c),
-        t.paint("◈", t.byte_utf8, c),
-        t.paint("UTF-8", t.fg_muted, c),
-        t.paint("▪", t.byte_high, c),
-        t.paint("High", t.fg_muted, c),
-        t.paint("×", t.byte_sentinel, c),
-        t.paint("0xFF", t.fg_muted, c),
+    let inner_w = width.saturating_sub(2);
+    let top = format!("╭{}╮", "─".repeat(inner_w));
+    let bot = format!("╰{}╯", "─".repeat(inner_w));
+    let _ = writeln!(out, "{}", t.paint(&top, t.border, c));
+    render_legend_row(out, opts, inner_w);
+    let _ = writeln!(out, "{}", t.paint(&bot, t.border, c));
+}
+
+fn render_legend_row(out: &mut String, opts: &FormatOptions, inner_w: usize) {
+    let t = &opts.theme;
+    let c = opts.color;
+    let items: &[(&str, crate::theme::Rgb, &str)] = &[
+        ("·", t.byte_null, "Null (00)"),
+        ("A", t.byte_ascii, "ASCII (21..7E)"),
+        ("␣↵⇥", t.byte_whitespace, "Space"),
+        ("␁␡", t.byte_control, "Control"),
+        ("◈", t.byte_utf8, "UTF-8"),
+        ("▪", t.byte_high, "High (80..FE)"),
+        ("×", t.byte_sentinel, "Sentinel (FF)"),
+    ];
+    let mut plain_len = 1usize; // leading space
+    let mut styled = String::from(" ");
+    for (idx, &(glyph, color_rgb, label)) in items.iter().enumerate() {
+        if idx > 0 {
+            styled.push_str("   ");
+            plain_len += 3;
+        }
+        let g_chars = glyph.chars().count();
+        let l_chars = label.chars().count();
+        if plain_len + g_chars + 1 + l_chars > inner_w {
+            break;
+        }
+        let _ = write!(
+            styled,
+            "{} {}",
+            t.paint_bold(glyph, color_rgb, c),
+            t.paint(label, t.fg_muted, c)
+        );
+        plain_len += g_chars + 1 + l_chars;
+    }
+    let pad = inner_w.saturating_sub(plain_len);
+    styled.push_str(&" ".repeat(pad));
+    let _ = writeln!(
+        out,
+        "{}{styled}{}",
+        t.paint("│", t.border, c),
+        t.paint("│", t.border, c)
     );
-    let _ = width;
-    let _ = writeln!(out, "{legend}");
 }

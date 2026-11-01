@@ -19,7 +19,19 @@ fn main() -> ExitCode {
     match run_cli(std::env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            let _ = writeln!(io::stderr(), "\x1b[1;31moctet error:\x1b[0m {err}");
+            let err_tty = io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+            let theme = Theme::dark();
+            if err_tty {
+                let badge = theme.paint_bold("◈ octet error:", theme.diff_del, true);
+                let hint = theme.paint(
+                    "Run 'octet --help' for usage and examples.",
+                    theme.fg_muted,
+                    true,
+                );
+                let _ = writeln!(io::stderr(), "{badge} {err}\n  {hint}");
+            } else {
+                let _ = writeln!(io::stderr(), "octet error: {err}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -57,6 +69,23 @@ struct CliConfig {
 
 impl Default for CliConfig {
     fn default() -> Self {
+        let theme = match std::env::var("OCTET_THEME")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "light" => Theme::light(),
+            _ => Theme::dark(),
+        };
+        let color_mode = match std::env::var("OCTET_COLOR")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "always" | "truecolor" | "yes" => ColorMode::TrueColor,
+            "never" | "no" | "none" => ColorMode::Never,
+            _ => ColorMode::Auto,
+        };
         Self {
             help: false,
             version: false,
@@ -80,8 +109,8 @@ impl Default for CliConfig {
             diff_path: None,
             svg_out: None,
             svg_title: None,
-            theme: Theme::dark(),
-            color_mode: ColorMode::Auto,
+            theme,
+            color_mode,
             input_path: None,
             output_path: None,
         }
@@ -89,9 +118,14 @@ impl Default for CliConfig {
 }
 
 fn run_cli(args: Vec<String>) -> Result<()> {
-    let cfg = parse_args(&args)?;
+    let mut cfg = parse_args(&args)?;
     let is_tty = io::stdout().is_terminal();
     let color = cfg.color_mode.is_enabled(is_tty) || cfg.svg_out.is_some();
+
+    // If invoked with no arguments in an interactive terminal, show help instead of hanging on stdin.
+    if args.is_empty() && io::stdin().is_terminal() {
+        cfg.help = true;
+    }
 
     if cfg.help {
         let help_text = render_help(&cfg.theme, color);
@@ -278,6 +312,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                 "version" => cfg.version = true,
                 "autoskip" => cfg.autoskip = Some(true),
                 "no-autoskip" => cfg.autoskip = Some(false),
+                "hex" | "hexadecimal" => cfg.radix = Radix::Hex,
                 "bits" | "binary" => cfg.radix = Radix::Binary,
                 "octal" => cfg.radix = Radix::Octal,
                 "decimal" => cfg.radix = Radix::Decimal,
@@ -285,7 +320,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     let v = next_val("cols")?;
                     cfg.cols = Some(parse_byte_count(&v)? as usize);
                 }
-                "groupsize" | "group" => {
+                "groupsize" | "group-size" | "group" => {
                     let v = next_val("groupsize")?;
                     cfg.group_size = Some(parse_byte_count(&v)? as usize);
                 }
@@ -299,7 +334,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                 "name" => {
                     cfg.codegen_name = Some(next_val("name")?);
                 }
-                "length" | "len" => {
+                "length" | "len" | "bytes" => {
                     let v = next_val("length")?;
                     cfg.length = Some(parse_byte_count(&v)?);
                 }
@@ -363,8 +398,13 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     }
                 }
                 other => {
+                    let suggestion = suggest_long_flag(other);
+                    let suffix = match suggestion {
+                        Some(s) => format!(" (did you mean '--{s}'?)"),
+                        None => String::from(" (run 'octet --help' for usage)"),
+                    };
                     return Err(Error::InvalidArgument(format!(
-                        "unrecognized option '--{other}' (run 'octet --help' for usage)"
+                        "unrecognized option '--{other}'{suffix}"
                     )));
                 }
             }
@@ -401,6 +441,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     'a' => cfg.autoskip = Some(true),
                     'b' => cfg.radix = Radix::Binary,
                     'd' => cfg.radix = Radix::Decimal,
+                    'O' => cfg.radix = Radix::Octal,
                     'e' => cfg.little_endian = true,
                     'i' => cfg.include_codegen = true,
                     'p' => cfg.style = ViewStyle::Plain,
@@ -568,63 +609,142 @@ fn style_code_for_svg(code: &str, theme: &Theme, color: bool) -> String {
     out
 }
 
+fn suggest_long_flag(unknown: &str) -> Option<&'static str> {
+    const KNOWN_FLAGS: &[&str] = &[
+        "help",
+        "version",
+        "autoskip",
+        "no-autoskip",
+        "hex",
+        "bits",
+        "binary",
+        "octal",
+        "decimal",
+        "cols",
+        "columns",
+        "groupsize",
+        "group-size",
+        "little-endian",
+        "include",
+        "lang",
+        "name",
+        "length",
+        "seek",
+        "display-offset",
+        "offset",
+        "plain",
+        "compact",
+        "canonical",
+        "hexdump",
+        "classic",
+        "xxd",
+        "reverse",
+        "upper",
+        "no-annotate",
+        "search",
+        "inspect",
+        "diff",
+        "svg",
+        "svg-title",
+        "theme",
+        "color",
+    ];
+    let mut best: Option<(&'static str, usize)> = None;
+    for &candidate in KNOWN_FLAGS {
+        let dist = edit_distance(unknown, candidate);
+        if dist <= 3 && best.is_none_or(|(_, b_dist)| dist < b_dist) {
+            best = Some((candidate, dist));
+        }
+    }
+    best.map(|(s, _)| s)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0usize; b_chars.len() + 1];
+    for (i, &ca) in a_chars.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_chars.len()]
+}
+
 fn render_help(t: &Theme, c: bool) -> String {
     let mut out = String::new();
-    let bar = t.paint(&"─".repeat(86), t.border, c);
-    let _ = writeln!(
-        out,
-        "{}{bar}{}",
-        t.paint("╭", t.border, c),
-        t.paint("╮", t.border, c)
+    let inner_w = 104usize;
+    let top = t.paint(&format!("╭{}╮", "─".repeat(inner_w)), t.border, c);
+    let mid = t.paint(&format!("├{}┤", "─".repeat(inner_w)), t.border, c);
+    let bot = t.paint(&format!("╰{}╯", "─".repeat(inner_w)), t.border, c);
+
+    let _ = writeln!(out, "{top}");
+    let title_plain = format!(
+        " ◈ OCTET v{}  │  Information-Design Hex Viewer, Binary Inspector & xxd / hexdump Replacement",
+        env!("CARGO_PKG_VERSION")
     );
+    let title_pad = " ".repeat(inner_w.saturating_sub(title_plain.chars().count()));
     let _ = writeln!(
         out,
-        "{}  {} — {}          {}",
+        "{} {}  {}  {}{title_pad}{}",
         t.paint("│", t.border, c),
-        t.paint_bold("◈ OCTET", t.offset_active, c),
-        t.paint(
-            "Information-Design Hex Viewer, Binary Inspector & xxd Replacement",
+        t.paint_bold(
+            &format!("◈ OCTET v{}", env!("CARGO_PKG_VERSION")),
+            t.offset_active,
+            c
+        ),
+        t.paint("│", t.border, c),
+        t.paint_bold(
+            "Information-Design Hex Viewer, Binary Inspector & xxd / hexdump Replacement",
             t.fg_primary,
             c
         ),
-        t.paint("│", t.border, c)
+        t.paint("│", t.border, c),
     );
+    let _ = writeln!(out, "{mid}");
+    let usage_plain = " USAGE:  octet [OPTIONS] [INFILE [OUTFILE]]      (reads stdin when INFILE is omitted or '-')";
+    let usage_pad = " ".repeat(inner_w.saturating_sub(usage_plain.chars().count()));
     let _ = writeln!(
         out,
-        "{}{bar}{}",
-        t.paint("╰", t.border, c),
-        t.paint("╯", t.border, c)
+        "{} {}  {} {}{usage_pad}{}",
+        t.paint("│", t.border, c),
+        t.paint_bold("USAGE:", t.byte_control, c),
+        t.paint_bold("octet", t.offset_active, c),
+        t.paint(
+            "[OPTIONS] [INFILE [OUTFILE]]      (reads stdin when INFILE is omitted or '-')",
+            t.fg_secondary,
+            c
+        ),
+        t.paint("│", t.border, c),
     );
+    let _ = writeln!(out, "{bot}");
 
     let section =
         |title: &str| -> String { format!("\n{}", t.paint_bold(title, t.byte_control, c)) };
     let flag = |f: &str, desc: &str| -> String {
+        let f_padded = format!("{f:<34}");
         format!(
-            "  {:<28} {}",
-            t.paint_bold(f, t.byte_ascii, c),
+            "  {} {}",
+            t.paint_bold(&f_padded, t.byte_ascii, c),
             t.paint(desc, t.fg_primary, c)
         )
     };
 
-    let _ = writeln!(out, "{}", section("USAGE"));
-    let _ = writeln!(
-        out,
-        "  {} {}",
-        t.paint_bold("octet", t.offset_active, c),
-        t.paint("[OPTIONS] [INFILE [OUTFILE]]", t.fg_secondary, c)
-    );
-
     let _ = writeln!(
         out,
         "{}",
-        section("LAYOUT & RADIX OPTIONS (xxd / hexdump compatible)")
+        section("◈ VIEW PROFILES & RADIX OPTIONS (xxd & hexdump -C compatible)")
     );
     let _ = writeln!(
         out,
         "{}",
         flag(
             "-c, --cols <N>",
-            "Format <N> octets per row (default: 16, binary: 6)"
+            "Format <N> octets per row (default: 16, binary: 6, plain: 30)"
         )
     );
     let _ = writeln!(
@@ -632,7 +752,7 @@ fn render_help(t: &Theme, c: bool) -> String {
         "{}",
         flag(
             "-g, --groupsize <N>",
-            "Group <N> octets per space-separated block (default: 2)"
+            "Group <N> octets per space-separated block (default: 2, -e: 4)"
         )
     );
     let _ = writeln!(
@@ -640,7 +760,7 @@ fn render_help(t: &Theme, c: bool) -> String {
         "{}",
         flag(
             "-e, --little-endian",
-            "Little-endian byte grouping (default group size: 4)"
+            "Little-endian byte grouping (100% compatible with xxd -e)"
         )
     );
     let _ = writeln!(
@@ -655,7 +775,7 @@ fn render_help(t: &Theme, c: bool) -> String {
         out,
         "{}",
         flag(
-            "-d, --decimal / --octal",
+            "-d, --decimal / -O, --octal",
             "Render bytes as 3-digit unsigned decimal or octal"
         )
     );
@@ -668,42 +788,42 @@ fn render_help(t: &Theme, c: bool) -> String {
         out,
         "{}",
         flag(
+            "-C, --canonical",
+            "Canonical BSD/GNU 'hexdump -C' layout (00000000  48 65 ... |He|)"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
+            "--classic / -q, --compact",
+            "Strict 'xxd' layout (--classic) or cardless compact table (-q)"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
             "-p, --plain",
             "Continuous plain hexadecimal stream (xxd -p)"
         )
     );
-    let _ = writeln!(
-        out,
-        "{}",
-        flag(
-            "-q, --compact / --classic",
-            "Compact table without cards (-q) or strict xxd output (--classic)"
-        )
-    );
-    let _ = writeln!(
-        out,
-        "{}",
-        flag(
-            "-C, --canonical",
-            "Canonical BSD/GNU 'hexdump -C' hex+ASCII format"
-        )
-    );
 
-    let _ = writeln!(out, "{}", section("SEEKING, SLICING & ELISION"));
+    let _ = writeln!(out, "{}", section("◈ SEEKING, SLICING & ELISION"));
     let _ = writeln!(
         out,
         "{}",
         flag(
             "-s, --seek <[+-]OFFSET>",
-            "Start at <OFFSET> (hex 0x100, KiB, or -0x40 from EOF)"
+            "Start at <OFFSET> (hex 0x100, 4KiB, or -0x40 from EOF)"
         )
     );
     let _ = writeln!(
         out,
         "{}",
         flag(
-            "-l, --length <LEN>",
-            "Read at most <LEN> bytes (also -n <LEN>)"
+            "-l, -n, --length <LEN>",
+            "Read at most <LEN> bytes (supports KiB, MiB, 0x...)"
         )
     );
     let _ = writeln!(
@@ -723,7 +843,11 @@ fn render_help(t: &Theme, c: bool) -> String {
         )
     );
 
-    let _ = writeln!(out, "{}", section("INSPECTION, DIFFING, CODEGEN & REVERSE"));
+    let _ = writeln!(
+        out,
+        "{}",
+        section("◈ INSPECTION, BINARY DIFFING, CODEGEN & REVERSE")
+    );
     let _ = writeln!(
         out,
         "{}",
@@ -761,7 +885,7 @@ fn render_help(t: &Theme, c: bool) -> String {
         "{}",
         flag(
             "-r, --reverse",
-            "Reverse hex dump (octet, xxd, or -r -p plain) back to raw binary"
+            "Reverse hex dump (octet, xxd, hexdump -C, or -r -p) to binary"
         )
     );
     let _ = writeln!(
@@ -773,13 +897,13 @@ fn render_help(t: &Theme, c: bool) -> String {
         )
     );
 
-    let _ = writeln!(out, "{}", section("DESIGN SYSTEM & EXPORT"));
+    let _ = writeln!(out, "{}", section("◈ DESIGN SYSTEM & VECTOR EXPORT"));
     let _ = writeln!(
         out,
         "{}",
         flag(
             "--theme <dark|light>",
-            "Select calibrated color palette (default: dark)"
+            "Select calibrated color palette (or set OCTET_THEME)"
         )
     );
     let _ = writeln!(
@@ -787,7 +911,7 @@ fn render_help(t: &Theme, c: bool) -> String {
         "{}",
         flag(
             "--color <auto|always|never>",
-            "Control ANSI TrueColor output (respects NO_COLOR)"
+            "Control ANSI TrueColor output (respects NO_COLOR / OCTET_COLOR)"
         )
     );
     let _ = writeln!(
@@ -795,8 +919,51 @@ fn render_help(t: &Theme, c: bool) -> String {
         "{}",
         flag(
             "--svg <PATH>",
-            "Render vector terminal window screenshot to <PATH>"
+            "Render vector macOS terminal window screenshot to <PATH>"
         )
     );
+
+    let _ = writeln!(out, "\n{top}");
+    let ex_hdr = " ◈ QUICK EXAMPLES";
+    let ex_hdr_pad = " ".repeat(inner_w.saturating_sub(ex_hdr.chars().count()));
+    let _ = writeln!(
+        out,
+        "{}{}{ex_hdr_pad}{}",
+        t.paint("│", t.border, c),
+        t.paint_bold(ex_hdr, t.offset_active, c),
+        t.paint("│", t.border, c),
+    );
+    let examples = [
+        (
+            "octet firmware.bin",
+            "Smart view with entropy telemetry & header annotations",
+        ),
+        (
+            "octet --diff v1.bin v2.bin",
+            "Side-by-side binary delta comparison with context elision",
+        ),
+        (
+            "octet --inspect 0x10 -S 0xfeedfacf a.out",
+            "Multi-type data inspector at 0x10 + highlight Mach-O magic",
+        ),
+        (
+            "octet -i --lang rust -l 64 payload.bin",
+            "Generate Rust 'pub const PAYLOAD_BIN: &[u8; 64]' array",
+        ),
+    ];
+    for (cmd, note) in examples {
+        let row_plain_len = 3 + 40 + 2 + note.chars().count();
+        let pad = " ".repeat(inner_w.saturating_sub(row_plain_len));
+        let cmd_padded = format!("{cmd:<40}");
+        let _ = writeln!(
+            out,
+            "{}   {}  {}{pad}{}",
+            t.paint("│", t.border, c),
+            t.paint_bold(&cmd_padded, t.byte_ascii, c),
+            t.paint(note, t.fg_secondary, c),
+            t.paint("│", t.border, c),
+        );
+    }
+    let _ = writeln!(out, "{bot}");
     out
 }
