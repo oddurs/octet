@@ -123,33 +123,46 @@ pub fn inspect_header(data: &[u8]) -> Option<HeaderInspection> {
 }
 
 fn read_u16_le(data: &[u8], offset: usize) -> Option<u16> {
-    let bytes: [u8; 2] = data.get(offset..offset + 2)?.try_into().ok()?;
+    let end = offset.checked_add(2)?;
+    let bytes: [u8; 2] = data.get(offset..end)?.try_into().ok()?;
     Some(u16::from_le_bytes(bytes))
 }
 
 fn read_u16_be(data: &[u8], offset: usize) -> Option<u16> {
-    let bytes: [u8; 2] = data.get(offset..offset + 2)?.try_into().ok()?;
+    let end = offset.checked_add(2)?;
+    let bytes: [u8; 2] = data.get(offset..end)?.try_into().ok()?;
     Some(u16::from_be_bytes(bytes))
 }
 
 fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
-    let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+    let end = offset.checked_add(4)?;
+    let bytes: [u8; 4] = data.get(offset..end)?.try_into().ok()?;
     Some(u32::from_le_bytes(bytes))
 }
 
 fn read_u32_be(data: &[u8], offset: usize) -> Option<u32> {
-    let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+    let end = offset.checked_add(4)?;
+    let bytes: [u8; 4] = data.get(offset..end)?.try_into().ok()?;
     Some(u32::from_be_bytes(bytes))
 }
 
 fn read_u64_le(data: &[u8], offset: usize) -> Option<u64> {
-    let bytes: [u8; 8] = data.get(offset..offset + 8)?.try_into().ok()?;
+    let end = offset.checked_add(8)?;
+    let bytes: [u8; 8] = data.get(offset..end)?.try_into().ok()?;
     Some(u64::from_le_bytes(bytes))
 }
 
 fn read_u64_be(data: &[u8], offset: usize) -> Option<u64> {
-    let bytes: [u8; 8] = data.get(offset..offset + 8)?.try_into().ok()?;
+    let end = offset.checked_add(8)?;
+    let bytes: [u8; 8] = data.get(offset..end)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
+}
+
+fn sanitize_header_str(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .chars()
+        .map(|c| if c.is_control() { '·' } else { c })
+        .collect()
 }
 
 fn parse_png(data: &[u8]) -> HeaderInspection {
@@ -580,9 +593,8 @@ fn try_parse_macho_or_javaclass(data: &[u8]) -> Option<HeaderInspection> {
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(seg_bytes.len());
-            if let Ok(seg_name) = std::str::from_utf8(&seg_bytes[..seg_len])
-                && !seg_name.is_empty()
-            {
+            if seg_len > 0 {
+                let seg_name = sanitize_header_str(&seg_bytes[..seg_len]);
                 fields.push(FieldAnnotation {
                     range: hdr_size + 8..hdr_size + 24,
                     name: "cmd[0].segname",
@@ -668,7 +680,7 @@ fn parse_zip(data: &[u8]) -> HeaderInspection {
         });
 
         if name_len > 0 && data.len() >= 30 + name_len {
-            let name = String::from_utf8_lossy(&data[30..30 + name_len]).into_owned();
+            let name = sanitize_header_str(&data[30..30 + name_len]);
             summary = format!("First entry \"{name}\" ({method_str}, {uncomp_size} B)");
             fields.push(FieldAnnotation {
                 range: 30..30 + name_len,
@@ -778,7 +790,7 @@ fn parse_sqlite(data: &[u8]) -> HeaderInspection {
 
 fn parse_riff(data: &[u8]) -> HeaderInspection {
     let chunk_size = read_u32_le(data, 4).unwrap_or(0);
-    let form_type = String::from_utf8_lossy(&data[8..12]).into_owned();
+    let form_type = sanitize_header_str(&data[8..12]);
     let (format_name, mime) = match form_type.as_str() {
         "WAVE" => ("RIFF WAVE Audio", "audio/wav"),
         "WEBP" => ("WebP Image", "image/webp"),
@@ -872,7 +884,7 @@ fn parse_ogg(data: &[u8]) -> HeaderInspection {
 
 fn parse_tar(data: &[u8]) -> HeaderInspection {
     let name_end = data[..100].iter().position(|&b| b == 0).unwrap_or(100);
-    let first_entry = String::from_utf8_lossy(&data[..name_end]).into_owned();
+    let first_entry = sanitize_header_str(&data[..name_end]);
     HeaderInspection {
         format_name: "POSIX ustar Archive",
         mime_or_category: "application/x-tar",
@@ -910,15 +922,19 @@ fn parse_pe_mz(data: &[u8]) -> HeaderInspection {
             value: format!("0x{lfanew:08x} (PE header offset)"),
             accent_index: 1,
         });
-        let pe_off = lfanew as usize;
-        if data.get(pe_off..pe_off + 4) == Some(b"PE\0\0") {
+        if let Ok(pe_off) = usize::try_from(lfanew)
+            && let Some(pe_sig_end) = pe_off.checked_add(4)
+            && data.get(pe_off..pe_sig_end) == Some(b"PE\0\0")
+        {
             fields.push(FieldAnnotation {
-                range: pe_off..pe_off + 4,
+                range: pe_off..pe_sig_end,
                 name: "PE.signature",
                 value: "\"PE\\0\\0\" (Portable Executable)".to_owned(),
                 accent_index: 2,
             });
-            if let Some(machine) = read_u16_le(data, pe_off + 4) {
+            if let Some(coff_end) = pe_sig_end.checked_add(2)
+                && let Some(machine) = read_u16_le(data, pe_sig_end)
+            {
                 let arch = match machine {
                     0x8664 => "x86_64 (AMD64)",
                     0xaa64 => "ARM64",
@@ -927,7 +943,7 @@ fn parse_pe_mz(data: &[u8]) -> HeaderInspection {
                 };
                 summary = format!("Windows Portable Executable ({arch})");
                 fields.push(FieldAnnotation {
-                    range: pe_off + 4..pe_off + 6,
+                    range: pe_sig_end..coff_end,
                     name: "COFF.Machine",
                     value: format!("{arch} (0x{machine:04x})"),
                     accent_index: 3,
@@ -1064,7 +1080,7 @@ fn parse_pdf(data: &[u8]) -> HeaderInspection {
         .take(16)
         .position(|&b| b == b'\r' || b == b'\n')
         .unwrap_or_else(|| data.len().min(8));
-    let ver = String::from_utf8_lossy(&data[..end]).into_owned();
+    let ver = sanitize_header_str(&data[..end]);
     HeaderInspection {
         format_name: "PDF Document",
         mime_or_category: "application/pdf",
@@ -1102,7 +1118,7 @@ fn parse_jpeg(data: &[u8]) -> HeaderInspection {
 }
 
 fn parse_gif(data: &[u8]) -> HeaderInspection {
-    let sig = String::from_utf8_lossy(&data[..6]).into_owned();
+    let sig = sanitize_header_str(&data[..6]);
     let mut fields = vec![FieldAnnotation {
         range: 0..6,
         name: "GIF.signature",
@@ -1135,7 +1151,7 @@ fn parse_shebang(data: &[u8]) -> HeaderInspection {
         .take(80)
         .position(|&b| b == b'\r' || b == b'\n')
         .unwrap_or_else(|| data.len().min(32));
-    let line = String::from_utf8_lossy(&data[..end]).into_owned();
+    let line = sanitize_header_str(&data[..end]);
     HeaderInspection {
         format_name: "Executable Script (Shebang)",
         mime_or_category: "text/x-script",

@@ -138,13 +138,15 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
             }
             continue;
         }
+        let had_star = pending_star;
         pending_star = false;
 
         let base = *base_offset.get_or_insert(row_offset);
         if row_offset >= base {
             let rel_target = (row_offset - base) as usize;
             while out.len() < rel_target {
-                if !last_row_bytes.is_empty()
+                if had_star
+                    && !last_row_bytes.is_empty()
                     && (rel_target - out.len()).is_multiple_of(last_row_bytes.len())
                 {
                     out.extend_from_slice(&last_row_bytes);
@@ -203,8 +205,15 @@ fn parse_data_tokens(data_zone: &str) -> Vec<u8> {
     }
 
     let mut bytes = Vec::new();
-    for token in tokens {
-        if token.chars().all(|c| c.is_ascii_hexdigit()) && token.len().is_multiple_of(2) {
+    for raw_token in tokens {
+        let token = raw_token
+            .strip_prefix("0x")
+            .or_else(|| raw_token.strip_prefix("0X"))
+            .unwrap_or(raw_token);
+        if !token.is_empty()
+            && token.chars().all(|c| c.is_ascii_hexdigit())
+            && token.len().is_multiple_of(2)
+        {
             for i in (0..token.len()).step_by(2) {
                 if let Ok(b) = u8::from_str_radix(&token[i..i + 2], 16) {
                     bytes.push(b);

@@ -67,7 +67,7 @@ pub fn compute_diff(
 
     for row_idx in 0..total_rows {
         let start = row_idx * cols;
-        let offset = display_offset + start as u64;
+        let offset = display_offset.saturating_add(start as u64);
         let mut l_vec = Vec::with_capacity(cols);
         let mut r_vec = Vec::with_capacity(cols);
         let mut row_diff = false;
@@ -151,8 +151,18 @@ pub fn render_diff_ansi(
     let mut out = String::new();
     let left_short = basename(left_label);
     let right_short = basename(right_label);
+    let max_off = report
+        .rows
+        .iter()
+        .map(|r| match r {
+            DiffRow::Elided { start_offset, .. } => *start_offset,
+            DiffRow::Data { offset, .. } => *offset,
+        })
+        .max()
+        .unwrap_or(0);
+    let off_w = format!("{max_off:08x}").len();
     let side_w = 4 * cols + 2;
-    let table_w = 16 + 2 * side_w;
+    let table_w = (off_w + 8) + 2 * side_w;
     let inner_w = table_w.saturating_sub(2);
     let top_bar = format!("╭{}╮", "─".repeat(inner_w));
     let mid_bar = format!("├{}┤", "─".repeat(inner_w));
@@ -179,6 +189,7 @@ pub fn render_diff_ansi(
     );
     let _ = writeln!(out, "{}", theme.paint(&mid_bar, theme.border, color));
 
+    let off_hdr = format!(" {:<width$}", "OFFSET", width = off_w.saturating_sub(2));
     let left_hdr = pad_diff_cell(&format!("⊖ {left_short} ({} B)", report.left_len), side_w);
     let right_hdr = pad_diff_cell(
         &format!("⊕ {right_short} ({} B)", report.right_len),
@@ -188,7 +199,7 @@ pub fn render_diff_ansi(
         out,
         "{}{} {} {}  {}  {}{}",
         theme.paint("│", theme.border, color),
-        theme.paint_bold(" OFFSET", theme.fg_muted, color),
+        theme.paint_bold(&off_hdr, theme.fg_muted, color),
         theme.paint("│", theme.border, color),
         theme.paint_bold(&left_hdr, theme.diff_del, color),
         theme.paint("│", theme.border, color),
@@ -204,10 +215,10 @@ pub fn render_diff_ansi(
                 row_count,
                 byte_count,
             } => {
-                let off_str = theme.format_offset(*start_offset, 8, false, color);
+                let off_str = theme.format_offset(*start_offset, off_w, false, color);
                 let msg = pad_diff_cell(
                     &format!(" ⋮ ⋯ {row_count} identical rows ({byte_count} bytes) unchanged ⋯"),
-                    table_w.saturating_sub(9),
+                    table_w.saturating_sub(off_w + 1),
                 );
                 let _ = writeln!(
                     out,
@@ -222,7 +233,7 @@ pub fn render_diff_ansi(
                 right,
                 has_diff,
             } => {
-                let off_str = theme.format_offset(*offset, 8, false, color);
+                let off_str = theme.format_offset(*offset, off_w, false, color);
                 let marker = if *has_diff {
                     theme.paint_bold("Δ", theme.byte_control, color)
                 } else {

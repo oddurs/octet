@@ -569,6 +569,7 @@ fn escape_xml(input: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            c if c.is_control() && !matches!(c, '\t' | '\n' | '\r') => out.push('·'),
             _ => out.push(ch),
         }
     }

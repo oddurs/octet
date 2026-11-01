@@ -68,21 +68,33 @@ pub fn parse_byte_count(raw: &str) -> Result<u64> {
 
     let lower = s.to_ascii_lowercase();
     let (num_part, multiplier) = if let Some(n) = lower
+        .strip_suffix("tib")
+        .or_else(|| lower.strip_suffix("tb"))
+        .or_else(|| lower.strip_suffix('t'))
+    {
+        (n, 1024_u64 * 1024 * 1024 * 1024)
+    } else if let Some(n) = lower
+        .strip_suffix("gib")
+        .or_else(|| lower.strip_suffix("gb"))
+        .or_else(|| lower.strip_suffix('g'))
+    {
+        (n, 1024_u64 * 1024 * 1024)
+    } else if let Some(n) = lower
         .strip_suffix("mib")
         .or_else(|| lower.strip_suffix("mb"))
         .or_else(|| lower.strip_suffix('m'))
     {
-        (n, 1024 * 1024)
+        (n, 1024_u64 * 1024)
     } else if let Some(n) = lower
         .strip_suffix("kib")
         .or_else(|| lower.strip_suffix("kb"))
         .or_else(|| lower.strip_suffix('k'))
     {
-        (n, 1024)
+        (n, 1024_u64)
     } else if let Some(n) = lower.strip_suffix('b') {
-        (n, 1)
+        (n, 1_u64)
     } else {
-        (lower.as_str(), 1)
+        (lower.as_str(), 1_u64)
     };
 
     let base: u64 = num_part
@@ -102,10 +114,10 @@ pub fn slice_buffer<'a>(
     let start_idx = if let Some(spec) = seek_spec {
         let trimmed = spec.trim();
         if let Some(neg) = trimmed.strip_prefix('-') {
-            let back = parse_byte_count(neg)? as usize;
+            let back = usize::try_from(parse_byte_count(neg)?).unwrap_or(usize::MAX);
             data.len().saturating_sub(back)
         } else {
-            let pos = parse_byte_count(trimmed)? as usize;
+            let pos = usize::try_from(parse_byte_count(trimmed)?).unwrap_or(usize::MAX);
             pos.min(data.len())
         }
     } else {
@@ -114,7 +126,9 @@ pub fn slice_buffer<'a>(
 
     let remaining = &data[start_idx..];
     let sliced = if let Some(len) = length {
-        let take = (len as usize).min(remaining.len());
+        let take = usize::try_from(len)
+            .unwrap_or(usize::MAX)
+            .min(remaining.len());
         &remaining[..take]
     } else {
         remaining

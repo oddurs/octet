@@ -318,11 +318,18 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                 "decimal" => cfg.radix = Radix::Decimal,
                 "cols" | "columns" => {
                     let v = next_val("cols")?;
-                    cfg.cols = Some(parse_byte_count(&v)? as usize);
+                    let c = usize::try_from(parse_byte_count(&v)?).unwrap_or(usize::MAX);
+                    if c > 256 {
+                        return Err(Error::InvalidArgument(format!(
+                            "column count {c} exceeds maximum supported columns (256)"
+                        )));
+                    }
+                    cfg.cols = Some(c);
                 }
                 "groupsize" | "group-size" | "group" => {
                     let v = next_val("groupsize")?;
-                    cfg.group_size = Some(parse_byte_count(&v)? as usize);
+                    cfg.group_size =
+                        Some(usize::try_from(parse_byte_count(&v)?).unwrap_or(usize::MAX));
                 }
                 "little-endian" | "endian" => cfg.little_endian = true,
                 "include" => cfg.include_codegen = true,
@@ -451,12 +458,19 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     'u' => cfg.upper_hex = true,
                     'c' => {
                         let v = take_short_val('c')?;
-                        cfg.cols = Some(parse_byte_count(&v)? as usize);
+                        let c = usize::try_from(parse_byte_count(&v)?).unwrap_or(usize::MAX);
+                        if c > 256 {
+                            return Err(Error::InvalidArgument(format!(
+                                "column count {c} exceeds maximum supported columns (256)"
+                            )));
+                        }
+                        cfg.cols = Some(c);
                         break;
                     }
                     'g' => {
                         let v = take_short_val('g')?;
-                        cfg.group_size = Some(parse_byte_count(&v)? as usize);
+                        cfg.group_size =
+                            Some(usize::try_from(parse_byte_count(&v)?).unwrap_or(usize::MAX));
                         break;
                     }
                     'l' | 'n' => {
@@ -519,20 +533,21 @@ fn read_input_window(
 ) -> Result<(Vec<u8>, u64)> {
     if let Some(p) = path {
         let mut file = File::open(p)?;
+        let file_len = file.metadata().ok().map(|m| m.len());
         let start_off = if let Some(spec) = seek_spec {
             let trimmed = spec.trim();
             if let Some(neg) = trimmed.strip_prefix('-') {
                 let back = parse_byte_count(neg)?;
-                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                let len = file_len.unwrap_or(0);
                 let target = len.saturating_sub(back);
                 file.seek(SeekFrom::Start(target))?
             } else {
-                let pos = parse_byte_count(trimmed)?;
+                let raw_pos = parse_byte_count(trimmed)?;
+                let pos = file_len.map_or(raw_pos, |len| raw_pos.min(len));
                 match file.seek(SeekFrom::Start(pos)) {
                     Ok(actual) => actual,
                     Err(_) => {
-                        io::copy(&mut io::Read::by_ref(&mut file).take(pos), &mut io::sink())?;
-                        pos
+                        io::copy(&mut io::Read::by_ref(&mut file).take(pos), &mut io::sink())?
                     }
                 }
             }
@@ -559,14 +574,14 @@ fn read_input_window(
                 return Ok((sliced.to_vec(), off));
             }
             let pos = parse_byte_count(trimmed)?;
-            io::copy(&mut handle.by_ref().take(pos), &mut io::sink())?;
+            let skipped = io::copy(&mut handle.by_ref().take(pos), &mut io::sink())?;
             let mut buf = Vec::new();
             if let Some(limit) = length {
                 handle.take(limit).read_to_end(&mut buf)?;
             } else {
                 handle.read_to_end(&mut buf)?;
             }
-            Ok((buf, pos))
+            Ok((buf, skipped))
         } else {
             let mut buf = Vec::new();
             if let Some(limit) = length {

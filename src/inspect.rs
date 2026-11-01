@@ -97,7 +97,7 @@ impl ValueInspection {
         let utf8_char = decode_first_utf8_char(slice);
 
         Some(Self {
-            offset: display_offset + index as u64,
+            offset: display_offset.wrapping_add(index as u64),
             raw_bytes,
             int8,
             int16,
@@ -243,28 +243,27 @@ impl ValueInspection {
                 color,
             );
         }
-        if let Some((val, len)) = self.uleb128 {
-            let utf8_info = match self.utf8_char {
-                Some((ch, clen)) => format!("U+{:04X} {:?} ({clen} B)", ch as u32, ch),
-                None => String::from("Invalid UTF-8 lead"),
-            };
-            let line = format!(
-                "   {:<16} : {:<26} {:<16} : {}",
-                "ULEB128 Varint",
-                format!("{val} ({len} B)"),
-                "UTF-8 Codepoint",
-                utf8_info
-            );
-            write_card_row(
-                &mut out,
-                &line,
-                inner_w,
-                theme,
-                theme.fg_secondary,
-                false,
-                color,
-            );
-        }
+        let uleb_info = match self.uleb128 {
+            Some((val, len)) => format!("{val} ({len} B)"),
+            None => String::from("n/a (unterminated/overflow)"),
+        };
+        let utf8_info = match self.utf8_char {
+            Some((ch, clen)) => format!("U+{:04X} {:?} ({clen} B)", ch as u32, ch),
+            None => String::from("Invalid UTF-8 lead"),
+        };
+        let line = format!(
+            "   {:<16} : {:<26} {:<16} : {}",
+            "ULEB128 Varint", uleb_info, "UTF-8 Codepoint", utf8_info
+        );
+        write_card_row(
+            &mut out,
+            &line,
+            inner_w,
+            theme,
+            theme.fg_secondary,
+            false,
+            color,
+        );
         let _ = writeln!(out, "{}", theme.paint(&bot, theme.border, color));
         out
     }
@@ -303,6 +302,9 @@ fn decode_uleb128(slice: &[u8]) -> Option<(u64, usize)> {
     let mut shift = 0u32;
     for (i, &byte) in slice.iter().take(10).enumerate() {
         let low = u64::from(byte & 0x7f);
+        if shift == 63 && low > 1 {
+            return None;
+        }
         result |= low.checked_shl(shift)?;
         if (byte & 0x80) == 0 {
             return Some((result, i + 1));

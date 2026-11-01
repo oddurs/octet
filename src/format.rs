@@ -152,7 +152,7 @@ pub fn analyze_buffer(data: &[u8], opts: &FormatOptions) -> AnalyzedBuffer {
     while i < raw_chunks.len() {
         let (start_idx, chunk) = raw_chunks[i];
         rows.push(DisplayRow::Data {
-            offset: opts.display_offset + start_idx as u64,
+            offset: opts.display_offset.saturating_add(start_idx as u64),
             start_index: start_idx,
             bytes: chunk.to_vec(),
         });
@@ -186,8 +186,8 @@ pub fn analyze_buffer(data: &[u8], opts: &FormatOptions) -> AnalyzedBuffer {
                     None
                 };
                 rows.push(DisplayRow::Elided {
-                    start_offset: opts.display_offset + first_dup_idx as u64,
-                    end_offset: opts.display_offset + last_dup_idx as u64,
+                    start_offset: opts.display_offset.saturating_add(first_dup_idx as u64),
+                    end_offset: opts.display_offset.saturating_add(last_dup_idx as u64),
                     row_count: duplicate_count,
                     byte_count: duplicate_count * cols,
                     uniform_byte,
@@ -216,10 +216,11 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
 
     let analyzed = analyze_buffer(data, opts);
     let mut out = String::new();
-    let card_width = compute_card_width(opts);
+    let off_w = compute_offset_width(data.len(), opts.display_offset);
+    let card_width = compute_card_width(opts, off_w);
 
     if opts.style == ViewStyle::Smart {
-        render_header_banner(&mut out, &analyzed, opts, card_width);
+        render_header_banner(&mut out, &analyzed, opts, card_width, off_w);
     }
 
     if data.is_empty() {
@@ -228,9 +229,9 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
         }
         if opts.style == ViewStyle::Canonical {
             return if opts.display_offset > 0 {
-                let off_str = opts
-                    .theme
-                    .format_offset(opts.display_offset, 8, false, opts.color);
+                let off_str =
+                    opts.theme
+                        .format_offset(opts.display_offset, off_w, false, opts.color);
                 format!("{off_str}\n")
             } else {
                 String::new()
@@ -257,7 +258,7 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
                     bytes,
                     &analyzed,
                     opts,
-                    card_width,
+                    off_w,
                 );
             }
             DisplayRow::Elided {
@@ -270,9 +271,9 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
                 if matches!(opts.style, ViewStyle::Classic | ViewStyle::Canonical) {
                     let _ = writeln!(out, "*");
                 } else {
-                    let off_str =
-                        opts.theme
-                            .format_offset(*start_offset, 8, opts.upper_hex, opts.color);
+                    let off_str = opts
+                        .theme
+                        .format_offset(*start_offset, off_w, false, opts.color);
                     let kind = match uniform_byte {
                         Some(0x00) => String::from("of 0x00 "),
                         Some(b) => format!("of 0x{b:02x} "),
@@ -282,7 +283,7 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
                         "  ⋮   ⋯ {row_count} identical rows ({byte_count} bytes {kind}from 0x{start_offset:04x}..0x{end_offset:04x}) elided ⋯"
                     );
                     if opts.style == ViewStyle::Smart {
-                        let padded_msg = pad_or_clip(&msg, card_width.saturating_sub(9));
+                        let padded_msg = pad_or_clip(&msg, card_width.saturating_sub(off_w + 1));
                         let _ = writeln!(
                             out,
                             "{off_str}{}{}",
@@ -303,8 +304,8 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
     }
 
     if opts.style == ViewStyle::Canonical {
-        let end_off = opts.display_offset + data.len() as u64;
-        let off_str = opts.theme.format_offset(end_off, 8, false, opts.color);
+        let end_off = opts.display_offset.saturating_add(data.len() as u64);
+        let off_str = opts.theme.format_offset(end_off, off_w, false, opts.color);
         let _ = writeln!(out, "{off_str}");
     } else if opts.style == ViewStyle::Smart {
         if let Some(ref hdr) = analyzed.header {
@@ -350,7 +351,12 @@ fn effective_group_size(opts: &FormatOptions) -> usize {
     }
 }
 
-fn compute_table_core_width(opts: &FormatOptions) -> usize {
+fn compute_offset_width(data_len: usize, display_offset: u64) -> usize {
+    let max_off = display_offset.saturating_add(data_len.saturating_sub(1) as u64);
+    format!("{max_off:08x}").len()
+}
+
+fn compute_table_core_width(opts: &FormatOptions, off_w: usize) -> usize {
     let cols = opts.cols.max(1);
     let cell_w = match opts.radix {
         Radix::Hex => 2,
@@ -368,13 +374,14 @@ fn compute_table_core_width(opts: &FormatOptions) -> usize {
             0
         };
     let data_pane_w = cols * cell_w + spaces + mid_extra;
-    8 + 2 + data_pane_w + 2 + 1 + cols + 1
+    off_w + 2 + data_pane_w + 2 + 1 + cols + 1
 }
 
-fn compute_card_width(opts: &FormatOptions) -> usize {
-    // Ensure smart cards have 106 columns (inner_w = 104) so telemetry, inline rails, and
-    // header summaries form a unified grid.
-    compute_table_core_width(opts).max(106)
+fn compute_card_width(opts: &FormatOptions, off_w: usize) -> usize {
+    // Ensure smart cards have at least 106 columns (plus any extra width for 64-bit offsets)
+    // so telemetry, inline rails, and header summaries form a unified grid.
+    let min_smart_w = 106 + off_w.saturating_sub(8);
+    compute_table_core_width(opts, off_w).max(min_smart_w)
 }
 
 fn render_header_banner(
@@ -382,6 +389,7 @@ fn render_header_banner(
     analyzed: &AnalyzedBuffer,
     opts: &FormatOptions,
     width: usize,
+    off_w: usize,
 ) {
     let inner_w = width.saturating_sub(2);
     let t = &opts.theme;
@@ -442,11 +450,16 @@ fn render_header_banner(
 
     let mid_bar = format!("├{}┤", "─".repeat(inner_w));
     let _ = writeln!(out, "{}", t.paint(&mid_bar, t.border, c));
-    render_column_ruler_row(out, opts, width);
+    render_column_ruler_row(out, opts, width, off_w);
     let _ = writeln!(out, "{}", t.paint(&bot_bar, t.border, c));
 }
 
-fn render_column_ruler_row(out: &mut String, opts: &FormatOptions, card_width: usize) {
+fn render_column_ruler_row(
+    out: &mut String,
+    opts: &FormatOptions,
+    card_width: usize,
+    off_w: usize,
+) {
     let t = &opts.theme;
     let c = opts.color;
     let cols = opts.cols.max(1);
@@ -455,11 +468,12 @@ fn render_column_ruler_row(out: &mut String, opts: &FormatOptions, card_width: u
     let show_mid_divider =
         cols >= 8 && opts.style != ViewStyle::Classic && mid_col.is_multiple_of(group_size);
 
+    let off_hdr = format!(" {:<width$}", "OFFSET", width = off_w);
     let _ = write!(
         out,
         "{}{}",
         t.paint("│", t.border, c),
-        t.paint_bold(" OFFSET  ", t.fg_muted, c)
+        t.paint_bold(&off_hdr, t.fg_muted, c)
     );
 
     if opts.little_endian && opts.radix == Radix::Hex && group_size > 1 {
@@ -524,7 +538,7 @@ fn render_column_ruler_row(out: &mut String, opts: &FormatOptions, card_width: u
         t.paint("│", t.border, c)
     );
 
-    let core_w = compute_table_core_width(opts);
+    let core_w = compute_table_core_width(opts, off_w);
     if card_width > core_w + 4 {
         let rail_budget = card_width - core_w - 3;
         let padded = pad_or_clip("CONTEXT / ANNOTATIONS", rail_budget);
@@ -628,8 +642,9 @@ fn render_data_row(
     bytes: &[u8],
     analyzed: &AnalyzedBuffer,
     opts: &FormatOptions,
-    card_width: usize,
+    off_w: usize,
 ) {
+    let card_width = compute_card_width(opts, off_w);
     let t = &opts.theme;
     let c = opts.color;
     let cols = opts.cols.max(1);
@@ -641,7 +656,7 @@ fn render_data_row(
     let canonical_mid_gap =
         cols >= 8 && opts.style == ViewStyle::Canonical && mid_col.is_multiple_of(group_size);
 
-    let off_str = t.format_offset(offset, 8, false, c);
+    let off_str = t.format_offset(offset, off_w, false, c);
     if opts.style == ViewStyle::Classic {
         let _ = write!(out, "{off_str}: ");
     } else {
@@ -743,7 +758,7 @@ fn render_data_row(
 
     // In Smart mode, render the inline row context rail so the table aligns with the 106-col cards.
     if opts.style == ViewStyle::Smart {
-        let core_w = compute_table_core_width(opts);
+        let core_w = compute_table_core_width(opts, off_w);
         if card_width > core_w + 4 {
             let rail_budget = card_width - core_w - 3; // "  " + content + "│"
             let (note_text, note_color, is_bold) =
