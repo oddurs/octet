@@ -7,7 +7,16 @@
 
 `octet` is a single-crate, zero-dependency Rust library and CLI engineered around visual hierarchy, semantic byte typography, and automatic structural header annotations.
 
-![PNG Inspection, Search Highlighting & Zero-Run Elision](docs/screenshots/png_view.png)
+## `octet` vs Originals (`xxd` & `hexdump -C`)
+
+### `xxd` vs `octet` (PNG Header, UTF-8, Search & Zero-Run Elision)
+![xxd vs octet on PNG](docs/screenshots/side_by_side_xxd_vs_octet.png)
+
+### `hexdump -C` vs `octet` (Mach-O 64-bit ARM64 Header & Data Inspector)
+![hexdump -C vs octet on Mach-O](docs/screenshots/side_by_side_hexdump_vs_octet.png)
+
+### `xxd -b` vs `octet -b -q` (Binary Bit Dump)
+![xxd -b vs octet -b](docs/screenshots/side_by_side_bits_vs_octet.png)
 
 ---
 
