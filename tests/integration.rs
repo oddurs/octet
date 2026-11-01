@@ -173,7 +173,7 @@ fn test_codegen_languages() {
 
     let c = generate_code(&data, Some("magic.bin"), CodeLanguage::C, 8, true);
     assert!(c.contains("unsigned char magic_bin[]"));
-    assert!(c.contains("0xDE, 0xAD, 0xBE, 0xEF"));
+    assert!(c.contains("0XDE, 0XAD, 0XBE, 0XEF"));
     assert!(c.contains("unsigned int magic_bin_len = 4;"));
 }
 

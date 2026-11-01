@@ -57,10 +57,15 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     let mut base_offset: Option<u64> = None;
     let mut last_row_bytes: Vec<u8> = Vec::new();
+    let mut pending_star = false;
 
     for line in clean.lines() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.trim_end() == "*" {
+            pending_star = true;
             continue;
         }
         let Some(first_char) = trimmed.chars().next() else {
@@ -96,6 +101,7 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
             continue;
         }
         if rest.starts_with('*') {
+            pending_star = true;
             continue;
         }
 
@@ -112,8 +118,27 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
 
         let row_bytes = parse_data_tokens(data_zone);
         if row_bytes.is_empty() {
+            // In `hexdump -C`, a trailing `*` elision is followed by an offset-only EOF line.
+            if pending_star
+                && rest.is_empty()
+                && let Some(base) = base_offset
+                && row_offset >= base
+            {
+                let rel_target = (row_offset - base) as usize;
+                while out.len() < rel_target {
+                    if !last_row_bytes.is_empty()
+                        && (rel_target - out.len()).is_multiple_of(last_row_bytes.len())
+                    {
+                        out.extend_from_slice(&last_row_bytes);
+                    } else {
+                        out.push(0x00);
+                    }
+                }
+                pending_star = false;
+            }
             continue;
         }
+        pending_star = false;
 
         let base = *base_offset.get_or_insert(row_offset);
         if row_offset >= base {

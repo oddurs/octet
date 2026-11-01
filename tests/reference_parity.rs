@@ -237,23 +237,60 @@ fn test_xxd_seek_length_offset_and_c_include_file_parity() {
 
         let expected_str = String::from_utf8_lossy(&expected);
         let actual_str = String::from_utf8_lossy(&actual);
-        if flags.contains(&"-i") && flags.contains(&"-u") {
-            // Note: `xxd -i -u` emits `0XFF`, whereas `octet -i -u` emits `0xFF` so that
-            // uppercase hex literals remain valid syntax across C, Rust, Go, Python, and TS.
+        assert_eq!(
+            actual_str, expected_str,
+            "file parity mismatch vs /usr/bin/xxd with flags {flags:?}"
+        );
+    }
+
+    // Also verify stdin-mode `xxd -i` and `xxd -i -u` parity across corpora
+    for (name, payload) in reference_corpora() {
+        for flags in [&["-i"][..], &["-i", "-u"][..], &["-i", "-c", "8"][..]] {
+            let expected = run_with_stdin("/usr/bin/xxd", flags, &payload);
+            let mut octet_args = vec!["--classic", "--color=never"];
+            octet_args.extend_from_slice(flags);
+            let actual = run_with_stdin(octet_bin(), &octet_args, &payload);
             assert_eq!(
-                actual_str.replace("0x", "0X"),
-                expected_str,
-                "file parity mismatch vs /usr/bin/xxd with flags {flags:?}"
-            );
-        } else {
-            assert_eq!(
-                actual_str, expected_str,
-                "file parity mismatch vs /usr/bin/xxd with flags {flags:?}"
+                String::from_utf8_lossy(&actual),
+                String::from_utf8_lossy(&expected),
+                "stdin -i parity mismatch vs /usr/bin/xxd on corpus '{name}' with flags {flags:?}"
             );
         }
     }
 
     let _ = std::fs::remove_file(&sample_path);
+}
+
+#[test]
+fn test_hexdump_canonical_mode_reference_parity() {
+    if !has_system_tool("/usr/bin/hexdump") {
+        return;
+    }
+
+    let flag_sets: &[&[&str]] = &[
+        &["-C"],
+        &["-C", "-v"],
+        &["-C", "-n", "24"],
+        &["-C", "-s", "8", "-n", "19"],
+    ];
+
+    for (name, payload) in reference_corpora() {
+        for &flags in flag_sets {
+            if flags.contains(&"-s") && payload.len() < 8 {
+                continue;
+            }
+            let expected = run_with_stdin("/usr/bin/hexdump", flags, &payload);
+            let mut octet_args = vec!["--color=never"];
+            octet_args.extend_from_slice(flags);
+            let actual = run_with_stdin(octet_bin(), &octet_args, &payload);
+
+            assert_eq!(
+                String::from_utf8_lossy(&actual),
+                String::from_utf8_lossy(&expected),
+                "canonical parity mismatch vs /usr/bin/hexdump on corpus '{name}' with flags {flags:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -302,19 +339,26 @@ fn test_cross_tool_bidirectional_reverse_interoperability() {
             xxd_plain_rev, payload,
             "octet -p -> xxd -r -p failed for corpus '{name}'"
         );
+
+        // 6. /usr/bin/hexdump -C -> octet -r (including `*` elided runs at interior and EOF!)
+        if has_system_tool("/usr/bin/hexdump") {
+            let hd_out = run_with_stdin("/usr/bin/hexdump", &["-C"], &payload);
+            let recovered = run_with_stdin(octet_bin(), &["-r"], &hd_out);
+            assert_eq!(
+                recovered, payload,
+                "hexdump -C -> octet -r failed for corpus '{name}'"
+            );
+        }
     }
 
-    // 6. Verify native compatibility with raw /usr/bin/hexdump -C output
-    if has_system_tool("/usr/bin/hexdump") {
-        let sample = b"Octet parses canonical BSD hexdump -C lines seamlessly! 0123456789";
-        let hd_out = run_with_stdin("/usr/bin/hexdump", &["-C"], sample);
-        let recovered = run_with_stdin(octet_bin(), &["-r"], &hd_out);
-        assert_eq!(recovered, sample);
-    }
-
-    // 7. Library-level Smart & Compact dumps round-trip cleanly
+    // 7. Library-level Smart, Compact, Classic, & Canonical dumps round-trip cleanly
     let payload = prng_bytes(200, 0x55aa_55aa);
-    for style in [ViewStyle::Smart, ViewStyle::Compact, ViewStyle::Classic] {
+    for style in [
+        ViewStyle::Smart,
+        ViewStyle::Compact,
+        ViewStyle::Classic,
+        ViewStyle::Canonical,
+    ] {
         let opts = FormatOptions {
             style,
             radix: Radix::Hex,

@@ -32,6 +32,8 @@ pub enum ViewStyle {
     Compact,
     /// Strict `xxd`-compatible plain ASCII layout (`00000000: 4865 ...  Hello`).
     Classic,
+    /// Canonical BSD/GNU `hexdump -C` layout (`00000000  48 65 ...  |Hello|`).
+    Canonical,
     /// Continuous unformatted hex stream (`xxd -p`).
     Plain,
 }
@@ -169,7 +171,12 @@ pub fn analyze_buffer(data: &[u8], opts: &FormatOptions) -> AnalyzedBuffer {
                 repeat_end
             };
             let duplicate_count = elide_end.saturating_sub(i + 1);
-            if duplicate_count >= 2 {
+            let min_duplicates = if opts.style == ViewStyle::Canonical {
+                1
+            } else {
+                2
+            };
+            if duplicate_count >= min_duplicates {
                 let first_dup_idx = raw_chunks[i + 1].0;
                 let last_dup_idx =
                     raw_chunks[elide_end - 1].0 + raw_chunks[elide_end - 1].1.len() - 1;
@@ -219,6 +226,16 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
         if opts.style == ViewStyle::Classic {
             return String::new();
         }
+        if opts.style == ViewStyle::Canonical {
+            return if opts.display_offset > 0 {
+                let off_str = opts
+                    .theme
+                    .format_offset(opts.display_offset, 8, false, opts.color);
+                format!("{off_str}\n")
+            } else {
+                String::new()
+            };
+        }
         let msg = opts
             .theme
             .paint("  (empty input: 0 bytes)", opts.theme.fg_muted, opts.color);
@@ -250,7 +267,7 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
                 byte_count,
                 uniform_byte,
             } => {
-                if opts.style == ViewStyle::Classic {
+                if matches!(opts.style, ViewStyle::Classic | ViewStyle::Canonical) {
                     let _ = writeln!(out, "*");
                 } else {
                     let off_str =
@@ -285,7 +302,11 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
         }
     }
 
-    if opts.style == ViewStyle::Smart {
+    if opts.style == ViewStyle::Canonical {
+        let end_off = opts.display_offset + data.len() as u64;
+        let off_str = opts.theme.format_offset(end_off, 8, false, opts.color);
+        let _ = writeln!(out, "{off_str}");
+    } else if opts.style == ViewStyle::Smart {
         if let Some(ref hdr) = analyzed.header {
             render_annotation_footer(&mut out, hdr, opts, card_width);
         } else {
@@ -519,8 +540,11 @@ fn render_data_row(
     let cols = opts.cols.max(1);
     let group_size = effective_group_size(opts);
     let mid_col = cols / 2;
-    let show_mid_divider =
-        cols >= 8 && opts.style != ViewStyle::Classic && mid_col.is_multiple_of(group_size);
+    let show_mid_divider = cols >= 8
+        && !matches!(opts.style, ViewStyle::Classic | ViewStyle::Canonical)
+        && mid_col.is_multiple_of(group_size);
+    let canonical_mid_gap =
+        cols >= 8 && opts.style == ViewStyle::Canonical && mid_col.is_multiple_of(group_size);
 
     let off_str = t.format_offset(offset, 8, false, c);
     if opts.style == ViewStyle::Classic {
@@ -545,6 +569,8 @@ fn render_data_row(
             if col > 0 {
                 if show_mid_divider && col == mid_col {
                     let _ = write!(out, " {} ", t.paint("⋮", t.border, c));
+                } else if canonical_mid_gap && col == mid_col {
+                    let _ = write!(out, "  ");
                 } else if col % group_size == 0 {
                     out.push(' ');
                 }
@@ -581,9 +607,11 @@ fn render_data_row(
     }
 
     // Format right-hand glyph pane
-    let rich_glyphs = opts.style != ViewStyle::Classic;
+    let rich_glyphs = !matches!(opts.style, ViewStyle::Classic | ViewStyle::Canonical);
     if opts.style == ViewStyle::Classic {
         let _ = write!(out, "  ");
+    } else if opts.style == ViewStyle::Canonical {
+        let _ = write!(out, "  {}", t.paint("|", t.border, c));
     } else {
         let _ = write!(out, "  {}", t.paint("│", t.border, c));
     }
@@ -609,7 +637,9 @@ fn render_data_row(
         let _ = write!(out, "{styled}");
     }
 
-    if opts.style != ViewStyle::Classic {
+    if opts.style == ViewStyle::Canonical {
+        let _ = write!(out, "{}", t.paint("|", t.border, c));
+    } else if opts.style != ViewStyle::Classic {
         for _ in bytes.len()..cols {
             out.push(' ');
         }

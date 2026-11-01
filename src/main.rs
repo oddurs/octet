@@ -172,15 +172,18 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         Radix::Hex => {
             if cfg.little_endian {
                 4
+            } else if cfg.style == ViewStyle::Canonical {
+                1
             } else {
                 2
             }
         }
     };
     let group_size = cfg.group_size.unwrap_or(default_group);
-    let autoskip = cfg
-        .autoskip
-        .unwrap_or(cfg.style == ViewStyle::Smart || cfg.style == ViewStyle::Compact);
+    let autoskip = cfg.autoskip.unwrap_or(matches!(
+        cfg.style,
+        ViewStyle::Smart | ViewStyle::Compact | ViewStyle::Canonical
+    ));
 
     let mut search_spans = Vec::new();
     for pat_str in &cfg.search_patterns {
@@ -309,6 +312,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                 }
                 "plain" | "ps" | "postscript" => cfg.style = ViewStyle::Plain,
                 "compact" | "quiet" => cfg.style = ViewStyle::Compact,
+                "canonical" | "hexdump" => cfg.style = ViewStyle::Canonical,
                 "classic" | "xxd" => {
                     cfg.style = ViewStyle::Classic;
                     if cfg.autoskip.is_none() {
@@ -386,7 +390,14 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
 
                 match ch {
                     'h' => cfg.help = true,
-                    'v' | 'V' => cfg.version = true,
+                    'V' => cfg.version = true,
+                    'v' => {
+                        if args.len() == 1 && chars.len() == 1 {
+                            cfg.version = true;
+                        } else {
+                            cfg.autoskip = Some(false);
+                        }
+                    }
                     'a' => cfg.autoskip = Some(true),
                     'b' => cfg.radix = Radix::Binary,
                     'd' => cfg.radix = Radix::Decimal,
@@ -394,7 +405,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     'i' => cfg.include_codegen = true,
                     'p' => cfg.style = ViewStyle::Plain,
                     'q' => cfg.style = ViewStyle::Compact,
-                    'C' => cfg.style = ViewStyle::Smart,
+                    'C' => cfg.style = ViewStyle::Canonical,
                     'r' => cfg.reverse = true,
                     'u' => cfg.upper_hex = true,
                     'c' => {
@@ -669,6 +680,14 @@ fn render_help(t: &Theme, c: bool) -> String {
             "Compact table without cards (-q) or strict xxd output (--classic)"
         )
     );
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
+            "-C, --canonical",
+            "Canonical BSD/GNU 'hexdump -C' hex+ASCII format"
+        )
+    );
 
     let _ = writeln!(out, "{}", section("SEEKING, SLICING & ELISION"));
     let _ = writeln!(
@@ -699,8 +718,8 @@ fn render_help(t: &Theme, c: bool) -> String {
         out,
         "{}",
         flag(
-            "-a, --autoskip / --no-autoskip",
-            "Collapse consecutive identical/zero rows (default in smart mode)"
+            "-a, --autoskip / -v, --no-autoskip",
+            "Collapse or expand consecutive identical/zero rows"
         )
     );
 

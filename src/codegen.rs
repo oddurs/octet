@@ -54,29 +54,35 @@ pub fn generate_code(
 
     match lang {
         CodeLanguage::C => {
-            let _ = writeln!(out, "unsigned char {base_ident}[] = {{");
-            write_hex_grid(&mut out, data, cols, upper, "  ", true);
-            let _ = writeln!(out, "}};");
-            let _ = writeln!(out, "unsigned int {base_ident}_len = {};", data.len());
+            if var_name.is_none() {
+                if !data.is_empty() {
+                    write_hex_grid(&mut out, data, cols, upper, true, "  ", true);
+                }
+            } else {
+                let _ = writeln!(out, "unsigned char {base_ident}[] = {{");
+                write_hex_grid(&mut out, data, cols, upper, true, "  ", true);
+                let _ = writeln!(out, "}};");
+                let _ = writeln!(out, "unsigned int {base_ident}_len = {};", data.len());
+            }
         }
         CodeLanguage::Rust => {
             let _ = writeln!(out, "pub const {upper_ident}: &[u8; {}] = &[", data.len());
-            write_hex_grid(&mut out, data, cols, upper, "    ", false);
+            write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
             let _ = writeln!(out, "];");
         }
         CodeLanguage::Go => {
             let _ = writeln!(out, "var {base_ident} = []byte{{");
-            write_hex_grid(&mut out, data, cols, upper, "\t", false);
+            write_hex_grid(&mut out, data, cols, upper, false, "\t", false);
             let _ = writeln!(out, "}}");
         }
         CodeLanguage::Python => {
             let _ = writeln!(out, "{upper_ident} = bytes([");
-            write_hex_grid(&mut out, data, cols, upper, "    ", false);
+            write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
             let _ = writeln!(out, "])");
         }
         CodeLanguage::TypeScript => {
             let _ = writeln!(out, "export const {upper_ident} = new Uint8Array([");
-            write_hex_grid(&mut out, data, cols, upper, "  ", false);
+            write_hex_grid(&mut out, data, cols, upper, false, "  ", false);
             let _ = writeln!(out, "]);");
         }
     }
@@ -88,6 +94,7 @@ fn write_hex_grid(
     data: &[u8],
     cols: usize,
     upper: bool,
+    upper_prefix_x: bool,
     indent: &str,
     omit_last_comma: bool,
 ) {
@@ -98,7 +105,11 @@ fn write_hex_grid(
             let abs_idx = row_idx * cols + col_idx;
             let is_last = abs_idx + 1 == total;
             if upper {
-                let _ = write!(out, "0x{byte:02X}");
+                if upper_prefix_x {
+                    let _ = write!(out, "0X{byte:02X}");
+                } else {
+                    let _ = write!(out, "0x{byte:02X}");
+                }
             } else {
                 let _ = write!(out, "0x{byte:02x}");
             }
