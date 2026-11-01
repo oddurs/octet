@@ -1,15 +1,16 @@
 // Copyright 2026 The Octet Authors.
 // Dual-licensed under MIT or Apache-2.0.
 
-//! Reverse hexadecimal dump to raw binary conversion (`-r` / `--reverse`).
+//! Reverse hexadecimal or binary dump to raw binary conversion (`-r` / `--reverse`).
 
 use crate::error::{Error, Result};
 
-/// Reverses a hexadecimal dump string back into raw binary bytes.
+/// Reverses a hexadecimal (or binary `-b`) dump string back into raw binary bytes.
 ///
 /// When `plain` is `true` (`-r -p`), all whitespace is ignored and pairs of hex digits are
-/// decoded sequentially. When `plain` is `false`, each data row's leading offset and hex column
-/// area are parsed (supporting both `octet` styled dumps and classic `xxd` dumps).
+/// decoded sequentially. When `plain` is `false`, each data row's leading offset and data column
+/// area are parsed (supporting `octet` smart dumps with elided rows, classic `xxd` dumps, and
+/// `-b` binary dumps).
 pub fn reverse_dump(input: &str, plain: bool) -> Result<Vec<u8>> {
     if plain {
         return reverse_plain(input);
@@ -62,7 +63,6 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
         if trimmed.is_empty() {
             continue;
         }
-        // Skip decorative borders, headers, annotations, and elision markers.
         let Some(first_char) = trimmed.chars().next() else {
             continue;
         };
@@ -70,7 +70,6 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
             continue;
         }
 
-        // Extract leading hex offset token (may end with ':' in xxd or space in octet).
         let offset_end = trimmed
             .find(|c: char| !c.is_ascii_hexdigit())
             .unwrap_or(trimmed.len());
@@ -84,13 +83,24 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
         let rest = &trimmed[offset_end..];
         let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
 
-        // Elision marker line (`⋮` or `*`) -> skip, gap will be filled when next offset arrives.
-        if rest.starts_with('⋮') || rest.starts_with('*') {
+        // If this is an `octet` elision bridge (`⋮   ⋯ N identical rows ...`), immediately
+        // materialize the elided rows so even trailing elided runs at EOF are preserved.
+        if rest.starts_with('⋮') {
+            if let Some(elided_rows) = parse_elided_row_count(rest)
+                && !last_row_bytes.is_empty()
+            {
+                for _ in 0..elided_rows {
+                    out.extend_from_slice(&last_row_bytes);
+                }
+            }
+            continue;
+        }
+        if rest.starts_with('*') {
             continue;
         }
 
-        // Isolate the hex column before the glyph pane (`│` in octet, or two spaces in xxd).
-        let hex_zone = if let Some((before_pipe, _)) = rest.split_once('│') {
+        // Isolate the data column before the glyph pane (`│` in octet, or two spaces in xxd).
+        let data_zone = if let Some((before_pipe, _)) = rest.split_once('│') {
             before_pipe
         } else if let Some((before_gap, _)) = rest.split_once("  ") {
             before_gap
@@ -98,7 +108,7 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
             rest
         };
 
-        let row_bytes = parse_hex_tokens(hex_zone);
+        let row_bytes = parse_data_tokens(data_zone);
         if row_bytes.is_empty() {
             continue;
         }
@@ -106,7 +116,6 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
         let base = *base_offset.get_or_insert(row_offset);
         if row_offset >= base {
             let rel_target = (row_offset - base) as usize;
-            // If rows were elided via autoskip, repeat the last row (or 0x00) to fill the gap.
             while out.len() < rel_target {
                 if !last_row_bytes.is_empty()
                     && (rel_target - out.len()).is_multiple_of(last_row_bytes.len())
@@ -117,7 +126,6 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
                 }
             }
             if rel_target < out.len() {
-                // Overwrite in-place if offset seeks backward.
                 for (i, &b) in row_bytes.iter().enumerate() {
                     if rel_target + i < out.len() {
                         out[rel_target + i] = b;
@@ -137,12 +145,38 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn parse_hex_tokens(hex_zone: &str) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for token in hex_zone.split_whitespace() {
-        if token == "⋮" || token == "│" {
-            continue;
+fn parse_elided_row_count(rest: &str) -> Option<usize> {
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    for window in tokens.windows(3) {
+        if window[1] == "identical" && window[2].starts_with("row") {
+            return window[0].parse::<usize>().ok();
         }
+    }
+    None
+}
+
+fn parse_data_tokens(data_zone: &str) -> Vec<u8> {
+    let tokens: Vec<&str> = data_zone
+        .split_whitespace()
+        .filter(|&t| t != "⋮" && t != "│")
+        .collect();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    // Check if all tokens are 8-bit binary strings (`00` / `01` etc. of length 8).
+    let is_binary_row = tokens
+        .iter()
+        .all(|t| t.len() == 8 && t.chars().all(|c| c == '0' || c == '1'));
+    if is_binary_row {
+        return tokens
+            .iter()
+            .filter_map(|t| u8::from_str_radix(t, 2).ok())
+            .collect();
+    }
+
+    let mut bytes = Vec::new();
+    for token in tokens {
         if token.chars().all(|c| c.is_ascii_hexdigit()) && token.len().is_multiple_of(2) {
             for i in (0..token.len()).step_by(2) {
                 if let Ok(b) = u8::from_str_radix(&token[i..i + 2], 16) {

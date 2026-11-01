@@ -52,6 +52,12 @@ pub fn render_ansi_to_svg(ansi_output: &str, title: &str, theme: &Theme) -> Stri
       font-variant-ligatures: none;
       xml:space: preserve;
     }}
+    .ctrl-badge {{
+      font-family: 'Menlo', 'SF Mono', 'JetBrains Mono', monospace;
+      font-size: 6.2px;
+      font-weight: 700;
+      letter-spacing: -0.2px;
+    }}
     .title-text {{
       font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', sans-serif;
       font-size: 12.5px;
@@ -207,7 +213,55 @@ const fn is_vector_glyph(ch: char) -> bool {
             | '■'
             | '▪'
             | '·'
+            | '␣'
+            | '↵'
+            | '⇥'
+            | '\u{2400}'..='\u{2421}'
     )
+}
+
+fn control_picture_mnemonic(ch: char) -> Option<&'static str> {
+    match ch {
+        '↵' => Some("LF"),
+        '⇥' => Some("HT"),
+        _ => match ch as u32 {
+            0x2400 => Some("NL"),
+            0x2401 => Some("SH"),
+            0x2402 => Some("SX"),
+            0x2403 => Some("EX"),
+            0x2404 => Some("ET"),
+            0x2405 => Some("EQ"),
+            0x2406 => Some("AK"),
+            0x2407 => Some("BL"),
+            0x2408 => Some("BS"),
+            0x2409 => Some("HT"),
+            0x240A => Some("LF"),
+            0x240B => Some("VT"),
+            0x240C => Some("FF"),
+            0x240D => Some("CR"),
+            0x240E => Some("SO"),
+            0x240F => Some("SI"),
+            0x2410 => Some("DL"),
+            0x2411 => Some("D1"),
+            0x2412 => Some("D2"),
+            0x2413 => Some("D3"),
+            0x2414 => Some("D4"),
+            0x2415 => Some("NK"),
+            0x2416 => Some("SY"),
+            0x2417 => Some("EB"),
+            0x2418 => Some("CN"),
+            0x2419 => Some("EM"),
+            0x241A => Some("SB"),
+            0x241B => Some("ES"),
+            0x241C => Some("FS"),
+            0x241D => Some("GS"),
+            0x241E => Some("RS"),
+            0x241F => Some("US"),
+            0x2420 => Some("SP"),
+            0x2421 => Some("DE"),
+            _ => None,
+        },
+    }
 }
 
 fn try_render_vector_glyph(
@@ -225,7 +279,39 @@ fn try_render_vector_glyph(
     let x_end = x + w;
     let y_end = y + h;
 
+    if let Some(mnem) = control_picture_mnemonic(ch) {
+        let _ = writeln!(
+            svg,
+            r#"  <rect x="{:.2}" y="{:.2}" width="{:.2}" height="10.5" rx="1.6" fill="{hex}" opacity="0.16"/>"#,
+            x + 0.4,
+            cy - 5.2,
+            w - 0.8
+        );
+        let _ = writeln!(
+            svg,
+            r#"  <text x="{cx:.2}" y="{:.2}" text-anchor="middle" class="ctrl-badge" fill="{hex}">{mnem}</text>"#,
+            cy + 2.2
+        );
+        return true;
+    }
+
     match ch {
+        '␣' => {
+            // Crisp U-shaped open-box space indicator inside cell bounds
+            let _ = writeln!(
+                svg,
+                r#"  <path d="M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}" fill="none" stroke="{hex}" stroke-width="1.2"/>"#,
+                x + 1.6,
+                cy + 1.8,
+                x + 1.6,
+                cy + 4.4,
+                x_end - 1.6,
+                cy + 4.4,
+                x_end - 1.6,
+                cy + 1.8
+            );
+            true
+        }
         '─' => {
             let _ = writeln!(
                 svg,

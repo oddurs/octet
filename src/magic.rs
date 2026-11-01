@@ -52,8 +52,8 @@ pub fn inspect_header(data: &[u8]) -> Option<HeaderInspection> {
     if data.starts_with(b"\x7fELF") {
         return Some(parse_elf(data));
     }
-    if let Some(macho) = try_parse_macho(data) {
-        return Some(macho);
+    if let Some(macho_or_class) = try_parse_macho_or_javaclass(data) {
+        return Some(macho_or_class);
     }
     if data.starts_with(b"PK\x03\x04") {
         return Some(parse_zip(data));
@@ -64,6 +64,18 @@ pub fn inspect_header(data: &[u8]) -> Option<HeaderInspection> {
     if data.starts_with(b"SQLite format 3\0") {
         return Some(parse_sqlite(data));
     }
+    if data.starts_with(b"RIFF") && data.len() >= 12 {
+        return Some(parse_riff(data));
+    }
+    if data.starts_with(b"fLaC") {
+        return Some(parse_flac(data));
+    }
+    if data.starts_with(b"OggS") {
+        return Some(parse_ogg(data));
+    }
+    if data.len() >= 262 && &data[257..262] == b"ustar" {
+        return Some(parse_tar(data));
+    }
     if data.starts_with(b"MZ") {
         return Some(parse_pe_mz(data));
     }
@@ -72,6 +84,15 @@ pub fn inspect_header(data: &[u8]) -> Option<HeaderInspection> {
     }
     if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         return Some(parse_zstd(data));
+    }
+    if data.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        return Some(parse_xz(data));
+    }
+    if data.starts_with(b"BZh") && data.len() >= 4 && data[3].is_ascii_digit() {
+        return Some(parse_bzip2(data));
+    }
+    if data.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+        return Some(parse_lz4(data));
     }
     if data.starts_with(b"%PDF-") {
         return Some(parse_pdf(data));
@@ -140,70 +161,81 @@ fn parse_png(data: &[u8]) -> HeaderInspection {
     }];
     let mut summary = String::from("Portable Network Graphics");
 
-    if data.len() >= 33 && &data[12..16] == b"IHDR" {
-        let len = read_u32_be(data, 8).unwrap_or(0);
-        let width = read_u32_be(data, 16).unwrap_or(0);
-        let height = read_u32_be(data, 20).unwrap_or(0);
-        let bit_depth = data[24];
-        let color_type = data[25];
-        let color_desc = match color_type {
-            0 => "Grayscale",
-            2 => "Truecolor RGB",
-            3 => "Indexed Palette",
-            4 => "Grayscale + Alpha",
-            6 => "Truecolor RGBA",
-            _ => "Unknown Color",
-        };
-        let interlace = if data[28] == 1 {
-            "Adam7 Interlaced"
-        } else {
-            "Non-interlaced"
-        };
-        let crc = read_u32_be(data, 29).unwrap_or(0);
-
-        summary = format!("{width}×{height} px, {bit_depth}-bit {color_desc}, {interlace}");
+    if let Some(len) = read_u32_be(data, 8) {
         fields.push(FieldAnnotation {
             range: 8..12,
             name: "IHDR.length",
             value: format!("{len} bytes"),
             accent_index: 1,
         });
+    }
+    if data.len() >= 16 && &data[12..16] == b"IHDR" {
         fields.push(FieldAnnotation {
             range: 12..16,
             name: "IHDR.type",
             value: "\"IHDR\" (Image Header Chunk)".to_owned(),
             accent_index: 2,
         });
-        fields.push(FieldAnnotation {
-            range: 16..20,
-            name: "IHDR.width",
-            value: format!("{width} px"),
-            accent_index: 3,
-        });
-        fields.push(FieldAnnotation {
-            range: 20..24,
-            name: "IHDR.height",
-            value: format!("{height} px"),
-            accent_index: 4,
-        });
-        fields.push(FieldAnnotation {
-            range: 24..26,
-            name: "IHDR.pixel_fmt",
-            value: format!("{bit_depth}-bit {color_desc} (type={color_type})"),
-            accent_index: 5,
-        });
-        fields.push(FieldAnnotation {
-            range: 26..29,
-            name: "IHDR.Method",
-            value: format!("Deflate / Adaptive / {interlace}"),
-            accent_index: 0,
-        });
-        fields.push(FieldAnnotation {
-            range: 29..33,
-            name: "IHDR.crc32",
-            value: format!("0x{crc:08x}"),
-            accent_index: 1,
-        });
+        if let Some(width) = read_u32_be(data, 16) {
+            fields.push(FieldAnnotation {
+                range: 16..20,
+                name: "IHDR.width",
+                value: format!("{width} px"),
+                accent_index: 3,
+            });
+            if let Some(height) = read_u32_be(data, 20) {
+                summary = format!("{width}×{height} px");
+                fields.push(FieldAnnotation {
+                    range: 20..24,
+                    name: "IHDR.height",
+                    value: format!("{height} px"),
+                    accent_index: 4,
+                });
+                if data.len() >= 26 {
+                    let bit_depth = data[24];
+                    let color_type = data[25];
+                    let color_desc = match color_type {
+                        0 => "Grayscale",
+                        2 => "Truecolor RGB",
+                        3 => "Indexed Palette",
+                        4 => "Grayscale + Alpha",
+                        6 => "Truecolor RGBA",
+                        _ => "Unknown Color",
+                    };
+                    summary = format!("{width}×{height} px, {bit_depth}-bit {color_desc}");
+                    fields.push(FieldAnnotation {
+                        range: 24..26,
+                        name: "IHDR.pixel_fmt",
+                        value: format!("{bit_depth}-bit {color_desc} (type={color_type})"),
+                        accent_index: 5,
+                    });
+                    if data.len() >= 29 {
+                        let interlace = if data[28] == 1 {
+                            "Adam7 Interlaced"
+                        } else {
+                            "Non-interlaced"
+                        };
+                        summary = format!(
+                            "{width}×{height} px, {bit_depth}-bit {color_desc}, {interlace}"
+                        );
+                        fields.push(FieldAnnotation {
+                            range: 26..29,
+                            name: "IHDR.method",
+                            value: format!("Deflate / Adaptive / {interlace}"),
+                            accent_index: 0,
+                        });
+                    }
+                    if let Some(crc) = read_u32_be(data, 29) {
+                        fields.push(FieldAnnotation {
+                            range: 29..33,
+                            name: "IHDR.crc32",
+                            value: format!("0x{crc:08x}"),
+                            accent_index: 1,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     HeaderInspection {
@@ -359,46 +391,84 @@ fn parse_elf(data: &[u8]) -> HeaderInspection {
     }
 }
 
-fn try_parse_macho(data: &[u8]) -> Option<HeaderInspection> {
+fn try_parse_macho_or_javaclass(data: &[u8]) -> Option<HeaderInspection> {
     let magic_le = read_u32_le(data, 0)?;
     let magic_be = read_u32_be(data, 0)?;
 
     if magic_be == 0xcafebabe {
-        let nfat = read_u32_be(data, 4).unwrap_or(0);
-        let mut fields = vec![
-            FieldAnnotation {
-                range: 0..4,
-                name: "fat_magic",
-                value: "0xcafebabe (Mach-O Universal / Fat Binary)".to_owned(),
-                accent_index: 0,
-            },
-            FieldAnnotation {
-                range: 4..8,
-                name: "nfat_arch",
-                value: format!("{nfat} architecture slices"),
-                accent_index: 1,
-            },
-        ];
-        if data.len() >= 28 {
-            let cputype = read_u32_be(data, 8).unwrap_or(0);
-            let offset = read_u32_be(data, 16).unwrap_or(0);
-            let size = read_u32_be(data, 20).unwrap_or(0);
-            fields.push(FieldAnnotation {
-                range: 8..28,
-                name: "fat_arch[0]",
-                value: format!(
-                    "cpu={} offset=0x{offset:x} size={size} B",
-                    macho_cpu_name(cputype)
+        let nfat_or_ver = read_u32_be(data, 4).unwrap_or(0);
+        let major_ver = read_u16_be(data, 6).unwrap_or(0);
+        // Disambiguate Java `.class` (major_version >= 45 in bytes 6..8) from Mach-O Fat Binary
+        // (`nfat_arch` in bytes 4..8 is a small count 1..=32).
+        if (1..=32).contains(&nfat_or_ver) {
+            let mut fields = vec![
+                FieldAnnotation {
+                    range: 0..4,
+                    name: "fat_magic",
+                    value: "0xcafebabe (Mach-O Universal / Fat Binary)".to_owned(),
+                    accent_index: 0,
+                },
+                FieldAnnotation {
+                    range: 4..8,
+                    name: "nfat_arch",
+                    value: format!("{nfat_or_ver} architecture slices"),
+                    accent_index: 1,
+                },
+            ];
+            if data.len() >= 28 {
+                let cputype = read_u32_be(data, 8).unwrap_or(0);
+                let offset = read_u32_be(data, 16).unwrap_or(0);
+                let size = read_u32_be(data, 20).unwrap_or(0);
+                fields.push(FieldAnnotation {
+                    range: 8..28,
+                    name: "fat_arch[0]",
+                    value: format!(
+                        "cpu={} offset=0x{offset:x} size={size} B",
+                        macho_cpu_name(cputype)
+                    ),
+                    accent_index: 2,
+                });
+            }
+            return Some(HeaderInspection {
+                format_name: "Mach-O Universal Binary",
+                mime_or_category: "application/x-mach-binary",
+                summary: format!(
+                    "Universal fat binary containing {nfat_or_ver} architecture slice(s)"
                 ),
-                accent_index: 2,
+                fields,
+            });
+        } else if major_ver >= 45 {
+            let minor_ver = read_u16_be(data, 4).unwrap_or(0);
+            let jdk = major_ver.saturating_sub(44);
+            let mut fields = vec![
+                FieldAnnotation {
+                    range: 0..4,
+                    name: "Class.magic",
+                    value: "0xcafebabe (JVM Class File)".to_owned(),
+                    accent_index: 0,
+                },
+                FieldAnnotation {
+                    range: 4..8,
+                    name: "Class.version",
+                    value: format!("v{major_ver}.{minor_ver} (Java SE {jdk})"),
+                    accent_index: 1,
+                },
+            ];
+            if let Some(cp_count) = read_u16_be(data, 8) {
+                fields.push(FieldAnnotation {
+                    range: 8..10,
+                    name: "constant_pool",
+                    value: format!("{} entries", cp_count.saturating_sub(1)),
+                    accent_index: 2,
+                });
+            }
+            return Some(HeaderInspection {
+                format_name: "Java Class Bytecode",
+                mime_or_category: "application/java-vm",
+                summary: format!("JVM Classfile v{major_ver}.{minor_ver} (Java SE {jdk})"),
+                fields,
             });
         }
-        return Some(HeaderInspection {
-            format_name: "Mach-O Universal Binary",
-            mime_or_category: "application/x-mach-binary",
-            summary: format!("Universal fat binary containing {nfat} architecture slice(s)"),
-            fields,
-        });
     }
 
     let (is_64, is_le) = match magic_le {
@@ -434,41 +504,49 @@ fn try_parse_macho(data: &[u8]) -> Option<HeaderInspection> {
         _ => "Mach-O Image",
     };
 
-    let mut fields = vec![
-        FieldAnnotation {
-            range: 0..4,
-            name: "magic",
-            value: format!(
-                "0x{magic_le:08x} ({})",
-                if is_64 { "MH_MAGIC_64" } else { "MH_MAGIC" }
-            ),
-            accent_index: 0,
-        },
-        FieldAnnotation {
+    let mut fields = vec![FieldAnnotation {
+        range: 0..4,
+        name: "magic",
+        value: format!(
+            "0x{magic_le:08x} ({})",
+            if is_64 { "MH_MAGIC_64" } else { "MH_MAGIC" }
+        ),
+        accent_index: 0,
+    }];
+    if data.len() >= 8 {
+        fields.push(FieldAnnotation {
             range: 4..8,
             name: "cputype",
             value: format!("{cpu_str} (0x{cputype:08x})"),
             accent_index: 1,
-        },
-        FieldAnnotation {
+        });
+    }
+    if data.len() >= 12 {
+        fields.push(FieldAnnotation {
             range: 8..12,
             name: "cpusubtype",
             value: format!("0x{cpusubtype:08x}"),
             accent_index: 2,
-        },
-        FieldAnnotation {
+        });
+    }
+    if data.len() >= 16 {
+        fields.push(FieldAnnotation {
             range: 12..16,
             name: "filetype",
             value: format!("{ftype_str} ({filetype})"),
             accent_index: 3,
-        },
-        FieldAnnotation {
+        });
+    }
+    if data.len() >= 24 {
+        fields.push(FieldAnnotation {
             range: 16..24,
             name: "load_cmds",
             value: format!("{ncmds} cmds ({sizeofcmds} bytes total)"),
             accent_index: 4,
-        },
-        FieldAnnotation {
+        });
+    }
+    if data.len() >= 28 {
+        fields.push(FieldAnnotation {
             range: 24..28,
             name: "flags",
             value: format!(
@@ -476,8 +554,8 @@ fn try_parse_macho(data: &[u8]) -> Option<HeaderInspection> {
                 if flags & 0x200000 != 0 { " (PIE)" } else { "" }
             ),
             accent_index: 5,
-        },
-    ];
+        });
+    }
 
     let hdr_size = if is_64 { 32 } else { 28 };
     if let (Some(cmd), Some(cmdsize)) = (read32(hdr_size), read32(hdr_size + 4)) {
@@ -665,27 +743,29 @@ fn parse_sqlite(data: &[u8]) -> HeaderInspection {
     }];
     let mut summary = String::from("SQLite 3 Database");
 
-    if data.len() >= 32 {
+    if data.len() >= 18 {
         let raw_page = read_u16_be(data, 16).unwrap_or(0);
         let page_size = if raw_page == 1 {
             65536
         } else {
             u32::from(raw_page)
         };
-        let db_pages = read_u32_be(data, 28).unwrap_or(0);
         fields.push(FieldAnnotation {
             range: 16..18,
             name: "SQLite.page_size",
             value: format!("{page_size} bytes"),
             accent_index: 1,
         });
-        fields.push(FieldAnnotation {
-            range: 28..32,
-            name: "SQLite.db_pages",
-            value: format!("{db_pages} pages"),
-            accent_index: 2,
-        });
-        summary = format!("SQLite 3 Database ({page_size} B pages, {db_pages} total pages)");
+        summary = format!("SQLite 3 Database ({page_size} B pages)");
+        if let Some(db_pages) = read_u32_be(data, 28) {
+            fields.push(FieldAnnotation {
+                range: 28..32,
+                name: "SQLite.db_pages",
+                value: format!("{db_pages} pages"),
+                accent_index: 2,
+            });
+            summary = format!("SQLite 3 Database ({page_size} B pages, {db_pages} total pages)");
+        }
     }
 
     HeaderInspection {
@@ -693,6 +773,124 @@ fn parse_sqlite(data: &[u8]) -> HeaderInspection {
         mime_or_category: "application/vnd.sqlite3",
         summary,
         fields,
+    }
+}
+
+fn parse_riff(data: &[u8]) -> HeaderInspection {
+    let chunk_size = read_u32_le(data, 4).unwrap_or(0);
+    let form_type = String::from_utf8_lossy(&data[8..12]).into_owned();
+    let (format_name, mime) = match form_type.as_str() {
+        "WAVE" => ("RIFF WAVE Audio", "audio/wav"),
+        "WEBP" => ("WebP Image", "image/webp"),
+        "AVI " => ("RIFF AVI Video", "video/x-msvideo"),
+        _ => ("RIFF Container", "application/octet-stream"),
+    };
+    HeaderInspection {
+        format_name,
+        mime_or_category: mime,
+        summary: format!("{format_name} (form=\"{form_type}\", payload={chunk_size} B)"),
+        fields: vec![
+            FieldAnnotation {
+                range: 0..4,
+                name: "RIFF.magic",
+                value: "\"RIFF\" (Resource Interchange File Format)".to_owned(),
+                accent_index: 0,
+            },
+            FieldAnnotation {
+                range: 4..8,
+                name: "RIFF.size",
+                value: format!("{chunk_size} bytes"),
+                accent_index: 1,
+            },
+            FieldAnnotation {
+                range: 8..12,
+                name: "RIFF.form",
+                value: format!("\"{form_type}\""),
+                accent_index: 2,
+            },
+        ],
+    }
+}
+
+fn parse_flac(data: &[u8]) -> HeaderInspection {
+    let mut fields = vec![FieldAnnotation {
+        range: 0..4,
+        name: "FLAC.magic",
+        value: "\"fLaC\" (Free Lossless Audio Codec)".to_owned(),
+        accent_index: 0,
+    }];
+    if data.len() >= 8 {
+        let is_last = (data[4] & 0x80) != 0;
+        let block_type = data[4] & 0x7f;
+        let len = (u32::from(data[5]) << 16) | (u32::from(data[6]) << 8) | u32::from(data[7]);
+        fields.push(FieldAnnotation {
+            range: 4..8,
+            name: "FLAC.block[0]",
+            value: format!("type={block_type} (STREAMINFO), last={is_last}, len={len} B"),
+            accent_index: 1,
+        });
+    }
+    HeaderInspection {
+        format_name: "FLAC Audio",
+        mime_or_category: "audio/flac",
+        summary: "Free Lossless Audio Codec stream".to_owned(),
+        fields,
+    }
+}
+
+fn parse_ogg(data: &[u8]) -> HeaderInspection {
+    let mut fields = vec![FieldAnnotation {
+        range: 0..4,
+        name: "Ogg.capture",
+        value: "\"OggS\" (Ogg Page Header)".to_owned(),
+        accent_index: 0,
+    }];
+    if data.len() >= 18 {
+        let ver = data[4];
+        let hdr_type = data[5];
+        let serial = read_u32_le(data, 14).unwrap_or(0);
+        fields.push(FieldAnnotation {
+            range: 4..6,
+            name: "Ogg.ver_flags",
+            value: format!("version={ver}, flags=0x{hdr_type:02x}"),
+            accent_index: 1,
+        });
+        fields.push(FieldAnnotation {
+            range: 14..18,
+            name: "Ogg.serial",
+            value: format!("0x{serial:08x}"),
+            accent_index: 2,
+        });
+    }
+    HeaderInspection {
+        format_name: "Ogg Container",
+        mime_or_category: "application/ogg",
+        summary: "Ogg bitstream container page".to_owned(),
+        fields,
+    }
+}
+
+fn parse_tar(data: &[u8]) -> HeaderInspection {
+    let name_end = data[..100].iter().position(|&b| b == 0).unwrap_or(100);
+    let first_entry = String::from_utf8_lossy(&data[..name_end]).into_owned();
+    HeaderInspection {
+        format_name: "POSIX ustar Archive",
+        mime_or_category: "application/x-tar",
+        summary: format!("POSIX tar archive (first entry: \"{first_entry}\")"),
+        fields: vec![
+            FieldAnnotation {
+                range: 0..name_end.max(1),
+                name: "tar.name",
+                value: format!("\"{first_entry}\""),
+                accent_index: 0,
+            },
+            FieldAnnotation {
+                range: 257..262,
+                name: "tar.magic",
+                value: "\"ustar\" (POSIX IEEE P1003.1)".to_owned(),
+                accent_index: 1,
+            },
+        ],
     }
 }
 
@@ -804,6 +1002,59 @@ fn parse_zstd(data: &[u8]) -> HeaderInspection {
         mime_or_category: "application/zstd",
         summary: "RFC 8878 Zstandard compressed frame".to_owned(),
         fields,
+    }
+}
+
+fn parse_xz(data: &[u8]) -> HeaderInspection {
+    let mut fields = vec![FieldAnnotation {
+        range: 0..6,
+        name: "XZ.magic",
+        value: "\\xfd7zXZ\\0 (XZ Compressed Stream)".to_owned(),
+        accent_index: 0,
+    }];
+    if data.len() >= 8 {
+        fields.push(FieldAnnotation {
+            range: 6..8,
+            name: "XZ.stream_flags",
+            value: format!("0x{:02x}{:02x}", data[6], data[7]),
+            accent_index: 1,
+        });
+    }
+    HeaderInspection {
+        format_name: "XZ Compressed Archive",
+        mime_or_category: "application/x-xz",
+        summary: "LZMA2 XZ compressed stream".to_owned(),
+        fields,
+    }
+}
+
+fn parse_bzip2(data: &[u8]) -> HeaderInspection {
+    let level = data[3] as char;
+    HeaderInspection {
+        format_name: "bzip2 Compressed Archive",
+        mime_or_category: "application/x-bzip2",
+        summary: format!("bzip2 stream (block size = {level}00 kB)"),
+        fields: vec![FieldAnnotation {
+            range: 0..4,
+            name: "BZIP2.header",
+            value: format!("\"BZh{level}\" ({level}00 kB block size)"),
+            accent_index: 0,
+        }],
+    }
+}
+
+fn parse_lz4(data: &[u8]) -> HeaderInspection {
+    let _ = data;
+    HeaderInspection {
+        format_name: "LZ4 Frame",
+        mime_or_category: "application/x-lz4",
+        summary: "LZ4 compressed frame (0x184D2204)".to_owned(),
+        fields: vec![FieldAnnotation {
+            range: 0..4,
+            name: "LZ4.magic",
+            value: "0x184d2204 (LZ4 Frame Magic)".to_owned(),
+            accent_index: 0,
+        }],
     }
 }
 

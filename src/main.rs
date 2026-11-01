@@ -4,8 +4,8 @@
 //! Command-line interface for `octet`.
 
 use std::fmt::Write as _;
-use std::fs;
-use std::io::{self, IsTerminal as _, Read as _, Write as _};
+use std::fs::{self, File};
+use std::io::{self, IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -13,7 +13,6 @@ use octet::{
     CodeLanguage, ColorMode, Error, FormatOptions, Radix, Result, Theme, ValueInspection,
     ViewStyle, compute_diff, find_pattern_spans, generate_code, parse_byte_count,
     parse_search_pattern, render_ansi_to_svg, render_diff_ansi, render_dump, reverse_dump,
-    slice_buffer,
 };
 
 fn main() -> ExitCode {
@@ -110,16 +109,17 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let raw_input = read_input(cfg.input_path.as_deref())?;
-
     if cfg.reverse {
+        let raw_input = read_input_window(cfg.input_path.as_deref(), None, None)?.0;
         let text = String::from_utf8_lossy(&raw_input);
         let bytes = reverse_dump(&text, cfg.style == ViewStyle::Plain)?;
         write_output(cfg.output_path.as_deref(), &bytes)?;
         return Ok(());
     }
 
-    let (sliced, start_off) = slice_buffer(&raw_input, cfg.seek.as_deref(), cfg.length)?;
+    let (sliced_vec, start_off) =
+        read_input_window(cfg.input_path.as_deref(), cfg.seek.as_deref(), cfg.length)?;
+    let sliced = sliced_vec.as_slice();
     let base_disp_offset = cfg.display_offset.unwrap_or(start_off);
 
     // Code generation mode (`-i` / `--include` or `--lang`)
@@ -140,11 +140,11 @@ fn run_cli(args: Vec<String>) -> Result<()> {
 
     // Binary diff mode (`--diff <other>`)
     if let Some(ref right_path) = cfg.diff_path {
-        let right_raw = fs::read(right_path)?;
-        let (right_sliced, _) = slice_buffer(&right_raw, cfg.seek.as_deref(), cfg.length)?;
+        let (right_sliced, _) =
+            read_input_window(Some(right_path), cfg.seek.as_deref(), cfg.length)?;
         let cols = cfg.cols.unwrap_or(8);
         let autoskip = cfg.autoskip.unwrap_or(true);
-        let report = compute_diff(sliced, right_sliced, cols, base_disp_offset, autoskip);
+        let report = compute_diff(sliced, &right_sliced, cols, base_disp_offset, autoskip);
         let left_label = cfg.input_path.as_deref().unwrap_or("stdin");
         let rendered = render_diff_ansi(&report, left_label, right_path, cols, &cfg.theme, color);
         if let Some(ref svg_path) = cfg.svg_out {
@@ -456,13 +456,70 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
     Ok(cfg)
 }
 
-fn read_input(path: Option<&str>) -> Result<Vec<u8>> {
+fn read_input_window(
+    path: Option<&str>,
+    seek_spec: Option<&str>,
+    length: Option<u64>,
+) -> Result<(Vec<u8>, u64)> {
     if let Some(p) = path {
-        Ok(fs::read(p)?)
-    } else {
+        let mut file = File::open(p)?;
+        let start_off = if let Some(spec) = seek_spec {
+            let trimmed = spec.trim();
+            if let Some(neg) = trimmed.strip_prefix('-') {
+                let back = parse_byte_count(neg)?;
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                let target = len.saturating_sub(back);
+                file.seek(SeekFrom::Start(target))?
+            } else {
+                let pos = parse_byte_count(trimmed)?;
+                match file.seek(SeekFrom::Start(pos)) {
+                    Ok(actual) => actual,
+                    Err(_) => {
+                        io::copy(&mut io::Read::by_ref(&mut file).take(pos), &mut io::sink())?;
+                        pos
+                    }
+                }
+            }
+        } else {
+            0
+        };
+
         let mut buf = Vec::new();
-        io::stdin().read_to_end(&mut buf)?;
-        Ok(buf)
+        if let Some(limit) = length {
+            file.take(limit).read_to_end(&mut buf)?;
+        } else {
+            file.read_to_end(&mut buf)?;
+        }
+        Ok((buf, start_off))
+    } else {
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        if let Some(spec) = seek_spec {
+            let trimmed = spec.trim();
+            if trimmed.starts_with('-') {
+                let mut full = Vec::new();
+                handle.read_to_end(&mut full)?;
+                let (sliced, off) = octet::slice_buffer(&full, Some(trimmed), length)?;
+                return Ok((sliced.to_vec(), off));
+            }
+            let pos = parse_byte_count(trimmed)?;
+            io::copy(&mut handle.by_ref().take(pos), &mut io::sink())?;
+            let mut buf = Vec::new();
+            if let Some(limit) = length {
+                handle.take(limit).read_to_end(&mut buf)?;
+            } else {
+                handle.read_to_end(&mut buf)?;
+            }
+            Ok((buf, pos))
+        } else {
+            let mut buf = Vec::new();
+            if let Some(limit) = length {
+                handle.take(limit).read_to_end(&mut buf)?;
+            } else {
+                handle.read_to_end(&mut buf)?;
+            }
+            Ok((buf, 0))
+        }
     }
 }
 

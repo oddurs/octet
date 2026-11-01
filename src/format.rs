@@ -47,7 +47,7 @@ pub struct FormatOptions {
     pub radix: Radix,
     /// Number of bytes per row (`-c`).
     pub cols: usize,
-    /// Number of bytes per space-separated group (`-g`).
+    /// Number of bytes per space-separated group (`-g`, `0` means group entire row).
     pub group_size: usize,
     /// Format groups in little-endian byte order (`-e`).
     pub little_endian: bool,
@@ -222,7 +222,15 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
                 start_index,
                 bytes,
             } => {
-                render_data_row(&mut out, *offset, *start_index, bytes, &analyzed, opts);
+                render_data_row(
+                    &mut out,
+                    *offset,
+                    *start_index,
+                    bytes,
+                    &analyzed,
+                    opts,
+                    card_width,
+                );
             }
             DisplayRow::Elided {
                 start_offset,
@@ -245,11 +253,22 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
                     let msg = format!(
                         "  ⋮   ⋯ {row_count} identical rows ({byte_count} bytes {kind}from 0x{start_offset:04x}..0x{end_offset:04x}) elided ⋯"
                     );
-                    let _ = writeln!(
-                        out,
-                        "{off_str}{}",
-                        opts.theme.paint(&msg, opts.theme.fg_muted, opts.color)
-                    );
+                    if opts.style == ViewStyle::Smart {
+                        let padded_msg = pad_or_clip(&msg, card_width.saturating_sub(9));
+                        let _ = writeln!(
+                            out,
+                            "{off_str}{}{}",
+                            opts.theme
+                                .paint(&padded_msg, opts.theme.fg_muted, opts.color),
+                            opts.theme.paint("│", opts.theme.border, opts.color)
+                        );
+                    } else {
+                        let _ = writeln!(
+                            out,
+                            "{off_str}{}",
+                            opts.theme.paint(&msg, opts.theme.fg_muted, opts.color)
+                        );
+                    }
                 }
             }
         }
@@ -286,7 +305,16 @@ fn render_plain(data: &[u8], cols: usize, upper: bool) -> String {
     out
 }
 
-fn compute_card_width(opts: &FormatOptions) -> usize {
+fn effective_group_size(opts: &FormatOptions) -> usize {
+    let cols = opts.cols.max(1);
+    if opts.group_size == 0 {
+        cols
+    } else {
+        opts.group_size
+    }
+}
+
+fn compute_table_core_width(opts: &FormatOptions) -> usize {
     let cols = opts.cols.max(1);
     let cell_w = match opts.radix {
         Radix::Hex => 2,
@@ -294,17 +322,23 @@ fn compute_card_width(opts: &FormatOptions) -> usize {
         Radix::Octal => 3,
         Radix::Decimal => 3,
     };
-    let group_size = opts.group_size.max(1);
+    let group_size = effective_group_size(opts);
     let groups = cols.div_ceil(group_size);
     let spaces = groups.saturating_sub(1);
-    let mid_extra = if cols >= 8 && opts.style != ViewStyle::Classic {
-        2
-    } else {
-        0
-    };
+    let mid_extra =
+        if cols >= 8 && opts.style != ViewStyle::Classic && (cols / 2).is_multiple_of(group_size) {
+            2
+        } else {
+            0
+        };
     let data_pane_w = cols * cell_w + spaces + mid_extra;
-    // Ensure smart cards have 106 columns (inner_w = 104) so telemetry and header summaries align.
-    (8 + 2 + data_pane_w + 2 + cols + 2).max(106)
+    8 + 2 + data_pane_w + 2 + 1 + cols + 1
+}
+
+fn compute_card_width(opts: &FormatOptions) -> usize {
+    // Ensure smart cards have 106 columns (inner_w = 104) so telemetry, inline rails, and
+    // header summaries form a unified grid.
+    compute_table_core_width(opts).max(106)
 }
 
 fn render_header_banner(
@@ -463,13 +497,15 @@ fn render_data_row(
     bytes: &[u8],
     analyzed: &AnalyzedBuffer,
     opts: &FormatOptions,
+    card_width: usize,
 ) {
     let t = &opts.theme;
     let c = opts.color;
     let cols = opts.cols.max(1);
-    let group_size = opts.group_size.max(1);
+    let group_size = effective_group_size(opts);
     let mid_col = cols / 2;
-    let show_mid_divider = cols >= 8 && opts.style != ViewStyle::Classic;
+    let show_mid_divider =
+        cols >= 8 && opts.style != ViewStyle::Classic && mid_col.is_multiple_of(group_size);
 
     let off_str = t.format_offset(offset, 8, opts.upper_hex, c);
     if opts.style == ViewStyle::Classic {
@@ -480,7 +516,15 @@ fn render_data_row(
 
     // Format primary radix column
     if opts.little_endian && opts.radix == Radix::Hex && group_size > 1 {
-        render_little_endian_hex(out, start_index, bytes, analyzed, opts);
+        render_little_endian_hex(
+            out,
+            start_index,
+            bytes,
+            analyzed,
+            opts,
+            group_size,
+            show_mid_divider,
+        );
     } else {
         for col in 0..cols {
             if col > 0 {
@@ -556,7 +600,148 @@ fn render_data_row(
         }
         let _ = write!(out, "{}", t.paint("│", t.border, c));
     }
+
+    // In Smart mode, render the inline row context rail so the table aligns with the 106-col cards.
+    if opts.style == ViewStyle::Smart {
+        let core_w = compute_table_core_width(opts);
+        if card_width > core_w + 4 {
+            let rail_budget = card_width - core_w - 3; // "  " + content + "│"
+            let (note_text, note_color, is_bold) =
+                build_row_context_note(start_index, bytes, analyzed, opts);
+            let padded_note = pad_or_clip(&note_text, rail_budget);
+            let styled_note = if is_bold {
+                t.paint_bold(&padded_note, note_color, c)
+            } else {
+                t.paint(&padded_note, note_color, c)
+            };
+            let _ = write!(out, "  {styled_note}{}", t.paint("│", t.border, c));
+        }
+    }
+
     let _ = writeln!(out);
+}
+
+fn build_row_context_note(
+    start_index: usize,
+    bytes: &[u8],
+    analyzed: &AnalyzedBuffer,
+    opts: &FormatOptions,
+) -> (String, crate::theme::Rgb, bool) {
+    let t = &opts.theme;
+    let row_range = start_index..start_index + bytes.len();
+
+    // 1. Search match in this row
+    for span in &opts.search_spans {
+        if span.start < row_range.end && span.end > row_range.start {
+            let match_off = opts.display_offset + span.start as u64;
+            return (format!("★ match @ 0x{match_off:02x}"), t.byte_control, true);
+        }
+    }
+
+    // 2. Overlapping structural header annotations
+    if let Some(ref hdr) = analyzed.header {
+        let mut names = Vec::new();
+        let mut primary_accent = None;
+        for field in &hdr.fields {
+            if field.range.start < row_range.end && field.range.end > row_range.start {
+                if primary_accent.is_none() {
+                    primary_accent = Some(t.accent(field.accent_index));
+                }
+                if !names.contains(&field.name) {
+                    names.push(field.name);
+                }
+            }
+        }
+        if !names.is_empty() {
+            let joined = names.into_iter().take(3).collect::<Vec<_>>().join(" · ");
+            return (
+                format!("◂ {joined}"),
+                primary_accent.unwrap_or(t.offset_active),
+                false,
+            );
+        }
+    }
+
+    // 3. Multi-byte UTF-8 graphic sequence in this row
+    for (i, &b) in bytes.iter().enumerate() {
+        let abs = start_index + i;
+        if analyzed.classes.get(abs) == Some(&ByteClass::Utf8MultiByte)
+            && b >= 0xc0
+            && let Some(ch) = decode_utf8_at(&bytes[i..])
+            && !ch.is_control()
+            && !ch.is_whitespace()
+        {
+            return (
+                format!("◈ UTF-8 {:?} (U+{:04X})", ch, ch as u32),
+                t.byte_utf8,
+                false,
+            );
+        }
+    }
+
+    // 4. All-zero row
+    if !bytes.is_empty() && bytes.iter().all(|&b| b == 0) {
+        return (String::from("· zero block (0x00)"), t.fg_muted, false);
+    }
+
+    // 5. Sentinel 0xFF run (>= 4 bytes)
+    if bytes.windows(4).any(|w| w == [0xff, 0xff, 0xff, 0xff]) {
+        return (
+            String::from("× sentinel (0xffffffff)"),
+            t.byte_sentinel,
+            false,
+        );
+    }
+
+    // 6. Contiguous printable ASCII run (>= 4 chars)
+    if let Some(ascii_snippet) = extract_longest_ascii_run(bytes, 4) {
+        return (format!("▸ \"{ascii_snippet}\""), t.byte_ascii, false);
+    }
+
+    // 7. High-byte / binary data summary
+    let high_cnt = bytes.iter().filter(|&&b| b >= 0x80).count();
+    if high_cnt * 2 >= bytes.len() && !bytes.is_empty() {
+        return (String::from("▪ binary / high-entropy"), t.byte_high, false);
+    }
+
+    (String::new(), t.fg_muted, false)
+}
+
+fn decode_utf8_at(slice: &[u8]) -> Option<char> {
+    for len in 2..=slice.len().min(4) {
+        if let Ok(s) = std::str::from_utf8(&slice[..len])
+            && let Some(ch) = s.chars().next()
+        {
+            return Some(ch);
+        }
+    }
+    None
+}
+
+fn extract_longest_ascii_run(bytes: &[u8], min_len: usize) -> Option<String> {
+    let mut best: &[u8] = &[];
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if (0x20..=0x7e).contains(&b) {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take()
+            && i - s > best.len()
+        {
+            best = &bytes[s..i];
+        }
+    }
+    if let Some(s) = start
+        && bytes.len() - s > best.len()
+    {
+        best = &bytes[s..];
+    }
+    if best.len() >= min_len {
+        Some(String::from_utf8_lossy(best).trim().to_owned())
+    } else {
+        None
+    }
 }
 
 fn render_little_endian_hex(
@@ -565,18 +750,30 @@ fn render_little_endian_hex(
     bytes: &[u8],
     analyzed: &AnalyzedBuffer,
     opts: &FormatOptions,
+    group_size: usize,
+    show_mid_divider: bool,
 ) {
     let cols = opts.cols.max(1);
-    let group_size = opts.group_size.max(1);
+    let mid_col = cols / 2;
     let groups = cols.div_ceil(group_size);
     for g in 0..groups {
-        if g > 0 {
-            out.push(' ');
-        }
         let g_start = g * group_size;
         let g_end = (g_start + group_size).min(cols);
-        for col in (g_start..g_end).rev() {
-            if let Some(&byte) = bytes.get(col) {
+        if g > 0 {
+            if show_mid_divider && g_start == mid_col {
+                let _ = write!(
+                    out,
+                    " {} ",
+                    opts.theme.paint("⋮", opts.theme.border, opts.color)
+                );
+            } else {
+                out.push(' ');
+            }
+        }
+        let valid_end = g_end.min(bytes.len());
+        if valid_end > g_start {
+            for col in (g_start..valid_end).rev() {
+                let byte = bytes[col];
                 let abs_idx = start_index + col;
                 let class = analyzed
                     .classes
@@ -594,7 +791,12 @@ fn render_little_endian_hex(
                     opts.color,
                 );
                 let _ = write!(out, "{styled}");
-            } else {
+            }
+            for _ in valid_end..g_end {
+                let _ = write!(out, "  ");
+            }
+        } else {
+            for _ in g_start..g_end {
                 let _ = write!(out, "  ");
             }
         }
@@ -677,7 +879,6 @@ fn render_annotation_footer(
         let accent = t.accent(field.accent_index);
         let range_str = format!("[0x{:02x}..0x{:02x}]", field.range.start, field.range.end);
         let name_padded = format!("{:<16}", field.name);
-        // " ■ " (3) + range_str (12) + " " (1) + name_padded (16) + " " (1) = 33 chars prefix
         let prefix_len = 3 + range_str.chars().count() + 1 + name_padded.chars().count() + 1;
         let val_budget = inner_w.saturating_sub(prefix_len);
         let val_padded = pad_or_clip(&field.value, val_budget);

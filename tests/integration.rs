@@ -40,7 +40,7 @@ fn test_semantic_byte_classification_and_utf8() {
 }
 
 #[test]
-fn test_magic_header_recognition_png_elf_macho_zip_wasm() {
+fn test_magic_header_recognition_and_cafebabe_disambiguation() {
     // 1. PNG with IHDR (1920x1080, 8-bit RGBA)
     let mut png = Vec::new();
     png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
@@ -56,6 +56,10 @@ fn test_magic_header_recognition_png_elf_macho_zip_wasm() {
     assert!(png_hdr.summary.contains("1920×1080 px"));
     assert!(png_hdr.summary.contains("Truecolor RGBA"));
     assert!(png_hdr.fields.len() >= 7);
+
+    // Progressive PNG header recognition on a 24-byte slice
+    let short_png_hdr = inspect_header(&png[..24]).expect("short PNG should be recognized");
+    assert_eq!(short_png_hdr.fields.len(), 5);
 
     // 2. ELF 64-bit Little-Endian AArch64 PIE
     let mut elf = vec![0u8; 64];
@@ -88,28 +92,57 @@ fn test_magic_header_recognition_png_elf_macho_zip_wasm() {
     assert_eq!(macho_hdr.format_name, "Mach-O 64-bit Binary");
     assert!(macho_hdr.summary.contains("ARM64"));
 
-    // 4. WebAssembly
+    // 4. Disambiguate 0xCAFEBABE: Mach-O Universal vs Java Class Bytecode
+    let fat_bin = [0xca, 0xfe, 0xba, 0xbe, 0x00, 0x00, 0x00, 0x02];
+    let fat_hdr = inspect_header(&fat_bin).expect("Fat Mach-O");
+    assert_eq!(fat_hdr.format_name, "Mach-O Universal Binary");
+
+    let java_class = [0xca, 0xfe, 0xba, 0xbe, 0x00, 0x00, 0x00, 65, 0x00, 32];
+    let java_hdr = inspect_header(&java_class).expect("Java class");
+    assert_eq!(java_hdr.format_name, "Java Class Bytecode");
+    assert!(java_hdr.summary.contains("Java SE 21"));
+
+    // 5. RIFF WAVE & WebAssembly
+    let wave = b"RIFF\x24\x08\x00\x00WAVEfmt ";
+    let wave_hdr = inspect_header(wave).expect("WAVE should be recognized");
+    assert_eq!(wave_hdr.format_name, "RIFF WAVE Audio");
+
     let wasm = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07];
     let wasm_hdr = inspect_header(&wasm).expect("WASM should be recognized");
     assert_eq!(wasm_hdr.format_name, "WebAssembly Module");
 }
 
 #[test]
-fn test_roundtrip_reverse_smart_classic_and_plain() {
+fn test_roundtrip_reverse_smart_trailing_zeros_bits_classic_and_plain() {
     let mut original = Vec::new();
     original.extend_from_slice(b"\x89PNG\r\n\x1a\nHello Octet World!\n");
-    // Add 64 zero bytes to trigger autoskip elision in Smart mode!
+    // Add 64 zero bytes in the middle
     original.extend_from_slice(&[0u8; 64]);
-    original.extend_from_slice(b"Trailing footer payload \xff\xfe\xfd.");
+    original.extend_from_slice(b"Middle payload 1234567890ABCDEF!");
+    // End with 64 zero bytes at EOF to test trailing elided rows!
+    original.extend_from_slice(&[0u8; 64]);
 
-    // 1. Smart mode (with ANSI colors, header banner, annotations, and elided zero rows)
+    // 1. Smart mode (with ANSI colors, inline context rail, header/footer cards, and trailing elision)
     let smart_opts = FormatOptions::default();
     let smart_dump = render_dump(&original, &smart_opts);
     assert!(smart_dump.contains("elided"));
     let recovered_smart = reverse_dump(&smart_dump, false).expect("reverse smart dump");
     assert_eq!(recovered_smart, original);
 
-    // 2. Classic xxd mode
+    // 2. Binary (-b) mode round-trip
+    let bits_opts = FormatOptions {
+        style: ViewStyle::Compact,
+        radix: Radix::Binary,
+        cols: 6,
+        group_size: 1,
+        autoskip: false,
+        ..FormatOptions::default()
+    };
+    let bits_dump = render_dump(&original[..24], &bits_opts);
+    let recovered_bits = reverse_dump(&bits_dump, false).expect("reverse binary dump");
+    assert_eq!(recovered_bits, &original[..24]);
+
+    // 3. Classic xxd mode
     let classic_opts = FormatOptions {
         style: ViewStyle::Classic,
         autoskip: false,
@@ -120,7 +153,7 @@ fn test_roundtrip_reverse_smart_classic_and_plain() {
     let recovered_classic = reverse_dump(&classic_dump, false).expect("reverse classic dump");
     assert_eq!(recovered_classic, original);
 
-    // 3. Plain mode (-p / -r -p)
+    // 4. Plain mode (-p / -r -p)
     let plain_opts = FormatOptions {
         style: ViewStyle::Plain,
         cols: 30,
