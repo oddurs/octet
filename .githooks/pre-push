@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+set -eu
+
+echo "◈ [octet pre-push] Running full test suite and doc checks..."
+cargo test --all-targets
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps

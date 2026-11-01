@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+set -eu
+
+echo "◈ [octet pre-commit] Checking formatting (rustfmt)..."
+cargo fmt --all -- --check
+
+echo "◈ [octet pre-commit] Running Clippy lints..."
+cargo clippy --all-targets -- -D warnings
