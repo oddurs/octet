@@ -370,7 +370,11 @@ fn test_pretty_hex_structural_card_alignment_and_radices() {
             };
             let rendered = render_dump(sample, &opts);
             assert!(rendered.contains("OFFSET"));
-            let line_widths: Vec<usize> = rendered.lines().map(|l| l.chars().count()).collect();
+            // Terminal columns, not chars: the crab is the sample's one wide character.
+            let line_widths: Vec<usize> = rendered
+                .lines()
+                .map(|l| l.chars().map(|c| if c == '🦀' { 2 } else { 1 }).sum())
+                .collect();
             let expected_w = line_widths[0];
             for (idx, &w) in line_widths.iter().enumerate() {
                 assert_eq!(

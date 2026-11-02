@@ -48,6 +48,7 @@ pub mod magic;
 pub mod reverse;
 pub mod svg;
 pub mod theme;
+mod width;
 
 pub use crate::classify::{ByteClass, ByteStats, classify_slice, compute_entropy};
 pub use crate::codegen::{CodeLanguage, generate_code};

@@ -581,13 +581,18 @@ fn parse_ansi_line(line: &str, theme: &Theme) -> Vec<StyledCell> {
             }
             apply_sgr(&seq, theme, &mut fg, &mut bg, &mut bold, &mut underline);
         } else {
-            cells.push(StyledCell {
-                ch,
-                fg,
-                bg,
-                bold,
-                underline,
-            });
+            // The text renderers pad by terminal columns, so the grid must give a wide glyph
+            // two cells and a combining mark none, or every border after it drifts.
+            let width = crate::width::char_width(ch);
+            for idx in 0..width {
+                cells.push(StyledCell {
+                    ch: if idx == 0 { ch } else { ' ' },
+                    fg,
+                    bg,
+                    bold,
+                    underline,
+                });
+            }
         }
     }
     cells

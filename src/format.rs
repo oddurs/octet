@@ -9,6 +9,7 @@ use std::ops::Range;
 use crate::classify::{ByteClass, ByteStats, classify_slice};
 use crate::magic::{HeaderInspection, inspect_header};
 use crate::theme::Theme;
+use crate::width::pad_or_clip;
 
 /// Number base / representation for the primary data pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +225,7 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
         compute_offset_width(data.len(), opts.display_offset)
     };
     let card_width = compute_card_width(opts, off_w);
+    let spans_sorted = spans_are_sorted(&opts.search_spans);
     let mut out = String::with_capacity(analyzed.rows.len() * (card_width + 64) + 1024);
 
     if opts.style == ViewStyle::Smart {
@@ -265,7 +267,10 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
                     bytes,
                     &analyzed,
                     opts,
-                    off_w,
+                    RowLayout {
+                        off_w,
+                        spans_sorted,
+                    },
                 );
             }
             DisplayRow::Elided {
@@ -391,8 +396,19 @@ fn compute_card_width(opts: &FormatOptions, off_w: usize) -> usize {
     // Ensure smart cards have at least 106 columns (plus any extra width for 64-bit offsets)
     // so telemetry, inline rails, and header summaries form a unified grid.
     let min_smart_w = 106 + off_w.saturating_sub(8);
-    compute_table_core_width(opts, off_w).max(min_smart_w)
+    let core_w = compute_table_core_width(opts, off_w);
+    // A gap too narrow for the annotation rail would leave every row short of the card's
+    // right border, so the card hugs the table instead.
+    if min_smart_w > core_w + RAIL_MIN_GAP {
+        min_smart_w
+    } else {
+        core_w
+    }
 }
+
+/// Columns the card must exceed the table by before rows carry an annotation rail: two for
+/// the gap, one for the closing border, and at least two for text.
+const RAIL_MIN_GAP: usize = 4;
 
 fn render_header_banner(
     out: &mut String,
@@ -437,15 +453,10 @@ fn render_header_banner(
     let dist_bar = render_distribution_bar(&analyzed.stats, bar_w, t, c);
     let pct_summary = format_class_percentages(&analyzed.stats);
     let entropy_val_str = format!("{:4.2} b/B", analyzed.stats.entropy);
-    let line2_plain_len = 9
-        + entropy_val_str.chars().count()
-        + 2
-        + spark_chars
-        + 15
-        + bar_w
-        + 3
-        + pct_summary.chars().count();
-    let pad_needed = inner_w.saturating_sub(line2_plain_len);
+    let line2_fixed_len = 9 + entropy_val_str.chars().count() + 2 + spark_chars + 15 + bar_w + 3;
+    // The percentages go last so a card narrower than 106 columns clips them, not the border.
+    let pct_cell = pad_or_clip(&pct_summary, inner_w.saturating_sub(line2_fixed_len));
+    let pct_text = pct_cell.trim_end();
     let _ = writeln!(
         out,
         "{} {} {} [{}]  {}  Classes [{}]  {}{}{}",
@@ -455,8 +466,8 @@ fn render_header_banner(
         t.paint(&spark, t.byte_high, c),
         t.paint("│", t.border, c),
         dist_bar,
-        t.paint(&pct_summary, t.fg_secondary, c),
-        " ".repeat(pad_needed),
+        t.paint(pct_text, t.fg_secondary, c),
+        &pct_cell[pct_text.len()..],
         t.paint("│", t.border, c),
     );
 
@@ -576,7 +587,7 @@ fn render_column_ruler_row(
     );
 
     let core_w = compute_table_core_width(opts, off_w);
-    if card_width > core_w + 4 {
+    if card_width > core_w + RAIL_MIN_GAP {
         let rail_budget = card_width - core_w - 3;
         let padded = pad_or_clip("CONTEXT / ANNOTATIONS", rail_budget);
         let _ = write!(
@@ -669,22 +680,13 @@ pub(crate) fn neutralise_controls(s: &str) -> String {
         .collect()
 }
 
-fn pad_or_clip(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count > width {
-        if width >= 4 {
-            let mut clipped: String = s.chars().take(width - 2).collect();
-            clipped.push('…');
-            clipped.push(' ');
-            clipped
-        } else {
-            let mut clipped: String = s.chars().take(width.saturating_sub(1)).collect();
-            clipped.push('…');
-            clipped
-        }
-    } else {
-        format!("{s}{}", " ".repeat(width - count))
-    }
+/// Per-dump values every data row needs.
+#[derive(Clone, Copy)]
+struct RowLayout {
+    /// Width of the offset column.
+    off_w: usize,
+    /// Result of [`spans_are_sorted`] for `opts.search_spans`, computed once per dump.
+    spans_sorted: bool,
 }
 
 fn render_data_row(
@@ -694,8 +696,12 @@ fn render_data_row(
     bytes: &[u8],
     analyzed: &AnalyzedBuffer,
     opts: &FormatOptions,
-    off_w: usize,
+    layout: RowLayout,
 ) {
+    let RowLayout {
+        off_w,
+        spans_sorted,
+    } = layout;
     let card_width = compute_card_width(opts, off_w);
     let t = &opts.theme;
     let c = opts.color;
@@ -811,10 +817,10 @@ fn render_data_row(
     // In Smart mode, render the inline row context rail so the table aligns with the 106-col cards.
     if opts.style == ViewStyle::Smart {
         let core_w = compute_table_core_width(opts, off_w);
-        if card_width > core_w + 4 {
+        if card_width > core_w + RAIL_MIN_GAP {
             let rail_budget = card_width - core_w - 3; // "  " + content + "│"
             let (note_text, note_color, is_bold) =
-                build_row_context_note(start_index, bytes, analyzed, opts);
+                build_row_context_note(start_index, bytes, analyzed, opts, spans_sorted);
             let padded_note = pad_or_clip(&note_text, rail_budget);
             let styled_note = if is_bold {
                 t.paint_bold(&padded_note, note_color, c)
@@ -833,11 +839,12 @@ fn build_row_context_note(
     bytes: &[u8],
     analyzed: &AnalyzedBuffer,
     opts: &FormatOptions,
+    spans_sorted: bool,
 ) -> (String, crate::theme::Rgb, bool) {
     let t = &opts.theme;
     let row_range = start_index..start_index + bytes.len();
 
-    // 1. Search match in this row (using partition_point when sorted, with linear fallback)
+    // 1. Search match in this row
     let first_cand = opts
         .search_spans
         .partition_point(|r| r.end <= row_range.start);
@@ -848,11 +855,17 @@ fn build_row_context_note(
         let match_off = opts.display_offset.wrapping_add(span.start as u64);
         return (format!("★ match @ 0x{match_off:02x}"), t.byte_control, true);
     }
-    for span in &opts.search_spans {
-        if span.start < row_range.end && span.end > row_range.start {
-            let match_off = opts.display_offset.wrapping_add(span.start as u64);
-            return (format!("★ match @ 0x{match_off:02x}"), t.byte_control, true);
-        }
+    // Sorted, disjoint spans make a miss above conclusive: every later span starts past the
+    // row. Only spans a library caller passed out of order need the linear scan, which on
+    // sorted input would make each unmatched row cost O(matches).
+    if !spans_sorted
+        && let Some(span) = opts
+            .search_spans
+            .iter()
+            .find(|s| s.start < row_range.end && s.end > row_range.start)
+    {
+        let match_off = opts.display_offset.wrapping_add(span.start as u64);
+        return (format!("★ match @ 0x{match_off:02x}"), t.byte_control, true);
     }
 
     // 2. Overlapping structural header annotations
@@ -922,6 +935,12 @@ fn build_row_context_note(
     }
 
     (String::new(), t.fg_muted, false)
+}
+
+/// Whether `spans` are ordered and non-overlapping, as [`crate::inspect::find_pattern_spans`]
+/// returns them, so a binary search can answer "does any span touch this row".
+fn spans_are_sorted(spans: &[Range<usize>]) -> bool {
+    spans.iter().all(|r| r.start <= r.end) && spans.windows(2).all(|w| w[0].end <= w[1].start)
 }
 
 fn decode_utf8_at(slice: &[u8]) -> Option<char> {
@@ -1416,5 +1435,173 @@ mod tests {
             panic!("expected an elided run: {:?}", analyzed.rows);
         };
         assert_eq!((start_offset, end_offset), (0, 0x2f));
+    }
+
+    /// Asserts every non-blank line of `rendered` has the same terminal width.
+    fn assert_one_width(rendered: &str, ctx: &str) {
+        let widths: Vec<usize> = rendered
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::str_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "{ctx}: line widths {widths:?}\n{rendered}"
+        );
+    }
+
+    fn png_fixture() -> Vec<u8> {
+        let mut data =
+            b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x0a\0\0\0\x0a\x08\x02\0\0\0".to_vec();
+        data.extend((0u8..=255).cycle().take(300));
+        data
+    }
+
+    #[test]
+    fn smart_card_lines_share_one_width_for_every_layout() {
+        let data = png_fixture();
+        for radix in [Radix::Hex, Radix::Decimal, Radix::Octal, Radix::Binary] {
+            for little_endian in [false, true] {
+                for display_offset in [0, 0x1_0000_0000] {
+                    for cols in 1..=64 {
+                        for group_size in 0..=16 {
+                            let opts = FormatOptions {
+                                radix,
+                                little_endian,
+                                display_offset,
+                                cols,
+                                group_size,
+                                annotate_headers: true,
+                                ..plain(ViewStyle::Smart)
+                            };
+                            assert_one_width(
+                                &render_dump(&data, &opts),
+                                &format!(
+                                    "{radix:?} -c {cols} -g {group_size} le={little_endian} \
+                                     off={display_offset:#x}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn zip_fixture(entry: &str) -> Vec<u8> {
+        let mut data = b"PK\x03\x04\x14\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x0b\0\0\0".to_vec();
+        data.extend((entry.len() as u16).to_le_bytes());
+        data.extend([0, 0]);
+        data.extend(entry.as_bytes());
+        data.extend(b"hello world");
+        data
+    }
+
+    #[test]
+    fn wide_characters_keep_smart_card_borders_aligned() {
+        let text = "漢字テキスト 😀👍🏽 e\u{301} 한국어 ".repeat(8);
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("漢字漢字.png", png_fixture()),
+            (
+                "cjk.zip",
+                zip_fixture("漢字テキスト漢字テキスト漢字テキスト.txt"),
+            ),
+            ("utf8.txt", text.clone().into_bytes()),
+            ("😀.bin", text.into_bytes()),
+        ];
+        for (label, data) in cases {
+            for display_offset in [0, 0x1_0000_0000] {
+                let opts = FormatOptions {
+                    label: Some(label.to_owned()),
+                    annotate_headers: true,
+                    display_offset,
+                    ..plain(ViewStyle::Smart)
+                };
+                assert_one_width(&render_dump(&data, &opts), label);
+            }
+        }
+    }
+
+    /// The row rail as it was before the search lookup became a pure binary search, kept to
+    /// prove the rewrite renders the same note for every row.
+    fn legacy_search_note(spans: &[Range<usize>], row: Range<usize>) -> Option<usize> {
+        let first = spans.partition_point(|r| r.end <= row.start);
+        if let Some(span) = spans.get(first)
+            && span.start < row.end
+            && span.end > row.start
+        {
+            return Some(span.start);
+        }
+        spans
+            .iter()
+            .find(|s| s.start < row.end && s.end > row.start)
+            .map(|s| s.start)
+    }
+
+    #[test]
+    fn search_rail_matches_the_legacy_lookup() {
+        let mut data = b"needle in a haystack, needle again ".repeat(40);
+        data.extend(std::iter::repeat_n(0u8, 512));
+        data.extend(b"needleneedle needle");
+        let span_sets = [
+            crate::inspect::find_pattern_spans(&data, b"needle"),
+            crate::inspect::find_pattern_spans(&data, b"e"),
+            crate::inspect::find_pattern_spans(&data, &data[..40]),
+            crate::inspect::find_pattern_spans(&data, b"absent"),
+            vec![900..905, 3..4, 40..41],
+            vec![0..100, 5..6, 300..301],
+            vec![Range { start: 10, end: 5 }, 6..7, 40..40],
+        ];
+        for spans in span_sets {
+            let opts = FormatOptions {
+                search_spans: spans.clone(),
+                ..plain(ViewStyle::Smart)
+            };
+            let analyzed = analyze_buffer(&data, &opts);
+            let sorted = spans_are_sorted(&spans);
+            for row_start in (0..data.len()).step_by(opts.cols) {
+                let row_end = (row_start + opts.cols).min(data.len());
+                let (note, ..) = build_row_context_note(
+                    row_start,
+                    &data[row_start..row_end],
+                    &analyzed,
+                    &opts,
+                    sorted,
+                );
+                let shown = note
+                    .strip_prefix("★ match @ 0x")
+                    .map(|hex| usize::from_str_radix(hex, 16).expect("hex offset"));
+                assert_eq!(
+                    shown,
+                    legacy_search_note(&spans, row_start..row_end),
+                    "row {row_start:#x} with spans {spans:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_rail_lookup_is_logarithmic_on_rows_without_a_match() {
+        // A row past every match used to scan all of them, so a dump with many matches and
+        // many unmatched rows took quadratic time.
+        let spans: Vec<Range<usize>> = (0..1_000_000).map(|i| 2 * i..2 * i + 1).collect();
+        let opts = FormatOptions {
+            search_spans: spans,
+            ..plain(ViewStyle::Smart)
+        };
+        let data = [0x41u8; 16];
+        let analyzed = analyze_buffer(&data, &opts);
+        let started = std::time::Instant::now();
+        for row in 0..2_000 {
+            let start = 3_000_000 + row * 16;
+            let (note, ..) = build_row_context_note(start, &data, &analyzed, &opts, true);
+            assert!(!note.starts_with('★'));
+        }
+        // Linear scans need 2e9 comparisons here; binary search needs under 50 000.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "rail lookup took {:?}",
+            started.elapsed()
+        );
     }
 }
