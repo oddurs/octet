@@ -379,6 +379,77 @@ fn zero_columns_means_the_default_width() {
 }
 
 #[test]
+fn help_lists_every_flag_that_man_and_completions_document() {
+    let help = stdout_of(
+        &octet()
+            .args(["--help", "--color", "never"])
+            .output()
+            .expect("run octet --help"),
+    );
+    for flag in [
+        "--completions <bash|zsh|fish>",
+        "--man",
+        "-V, --version",
+        "-h, --help",
+        "--name <IDENT>",
+        "--svg-title <TITLE>",
+    ] {
+        assert!(help.contains(flag), "--help is missing {flag}");
+    }
+
+    // Every long flag that --help documents must also be in the man page
+    // and in each shell's completions.
+    let man = stdout_of(&octet().arg("--man").output().expect("run --man")).replace("\\-", "-");
+    let completions: Vec<(&str, String)> = ["bash", "zsh", "fish"]
+        .into_iter()
+        .map(|shell| {
+            let out = octet()
+                .args(["--completions", shell])
+                .output()
+                .expect("run --completions");
+            (shell, stdout_of(&out))
+        })
+        .collect();
+    for flag in long_flags(&help) {
+        assert!(man.contains(&flag), "man page is missing {flag}");
+        for (shell, script) in &completions {
+            let needle = if *shell == "fish" {
+                format!("-l {}", &flag[2..])
+            } else {
+                flag.clone()
+            };
+            assert!(script.contains(&needle), "{shell} completions miss {flag}");
+        }
+    }
+
+    // The boxed header and footer rows must stay the same width.
+    let widths: Vec<usize> = help
+        .lines()
+        .filter(|l| l.starts_with(['╭', '│', '├', '╰']))
+        .map(|l| l.chars().count())
+        .collect();
+    assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
+}
+
+/// The `--long-flag` tokens in the option list of `--help`, i.e. everything
+/// before the examples box.
+fn long_flags(help: &str) -> Vec<String> {
+    let options = help.split("QUICK EXAMPLES").next().unwrap_or(help);
+    let mut flags = Vec::new();
+    for word in options.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+        if let Some(name) = word.strip_prefix("--")
+            && name.starts_with(|c: char| c.is_ascii_lowercase())
+        {
+            let flag = format!("--{name}");
+            if !flags.contains(&flag) {
+                flags.push(flag);
+            }
+        }
+    }
+    flags
+}
+
+#[test]
 fn zero_length_prints_nothing_in_compatible_styles() {
     let input = scratch_file("zero_length", "in.bin", b"hello world");
     let render = |args: &[&str]| {

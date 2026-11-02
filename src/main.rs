@@ -1112,6 +1112,14 @@ fn render_help(t: &Theme, c: bool) -> String {
         out,
         "{}",
         flag(
+            "--name <IDENT>",
+            "Identifier for the -i array (default: derived from INFILE)"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
             "-r, --reverse",
             "Reverse hex dump (octet, xxd, hexdump -C, or -r -p) to binary"
         )
@@ -1158,6 +1166,27 @@ fn render_help(t: &Theme, c: bool) -> String {
             "Render vector macOS terminal window screenshot to <PATH>"
         )
     );
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
+            "--svg-title <TITLE>",
+            "Window title for the --svg screenshot"
+        )
+    );
+
+    let _ = writeln!(out, "{}", section("◈ SHELL INTEGRATION & META"));
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
+            "--completions <bash|zsh|fish>",
+            "Print a shell completion script"
+        )
+    );
+    let _ = writeln!(out, "{}", flag("--man", "Print the troff manual page"));
+    let _ = writeln!(out, "{}", flag("-V, --version", "Print the version"));
+    let _ = writeln!(out, "{}", flag("-h, --help", "Print this help"));
 
     let _ = writeln!(out, "\n{top}");
     let ex_hdr = " ◈ QUICK EXAMPLES";
@@ -1253,7 +1282,7 @@ _octet() {
         '--diff[Side-by-side binary diff]:file:_files' \
         '(-S --search)'{-S,--search}'[Highlight pattern]:pattern:' \
         '--inspect[Inspect multi-type values at offset]:offset:' \
-        '--strings[Extract printable ASCII and UTF-8 strings]' \
+        '--strings=-[Extract printable ASCII and UTF-8 strings]::min_len:' \
         '(-i --include)'{-i,--include}'[Generate source array]' \
         '--lang[Target language for codegen]:lang:(rust c go python ts zig csharp)' \
         '--name[Variable identifier for codegen]:name:' \
@@ -1263,6 +1292,7 @@ _octet() {
         '--theme[Select color palette]:theme:(dark light)' \
         '--color[Control ANSI color]:mode:(auto always never)' \
         '--svg[Render vector terminal SVG]:path:_files' \
+        '--svg-title[Window title for the SVG]:title:' \
         '--completions[Generate shell completions]:shell:(bash zsh fish)' \
         '--man[Render troff manual page]' \
         '*:file:_files'
@@ -1295,12 +1325,14 @@ complete -c octet -l inspect -r -d "Inspect values at offset"
 complete -c octet -l strings -d "Extract printable ASCII and UTF-8 strings"
 complete -c octet -s i -l include -d "Generate source code array"
 complete -c octet -l lang -r -a "rust c go python ts zig csharp" -d "Codegen language"
+complete -c octet -l name -r -d "Variable identifier for codegen"
 complete -c octet -s r -l reverse -d "Reverse hex dump to binary"
 complete -c octet -s j -l json -d "Emit structured JSON report"
 complete -c octet -l no-annotate -d "Disable magic header annotations"
 complete -c octet -l theme -r -a "dark light" -d "Color palette"
 complete -c octet -l color -r -a "auto always never" -d "Color mode"
 complete -c octet -l svg -r -F -d "Render vector SVG screenshot"
+complete -c octet -l svg-title -r -d "Window title for the SVG"
 complete -c octet -l completions -r -a "bash zsh fish" -d "Generate shell completions"
 complete -c octet -l man -d "Render troff manual page"
 "#,
@@ -1378,11 +1410,17 @@ Extract printable ASCII and graphic UTF-8 string literals (default >= 4 characte
 \fB\-i\fR, \fB\-\-include\fR [\fB\-\-lang\fR \fIL\fR]
 Emit source array in rust, c (default), go, python, ts, zig, or csharp.
 .TP
+\fB\-\-name\fR \fIIDENT\fR
+Identifier for the generated array (default: derived from \fIINFILE\fR).
+.TP
 \fB\-r\fR, \fB\-\-reverse\fR
 Reverse hex dump (octet, xxd, hexdump \-C, or \-r \-p) back to binary.
 .TP
 \fB\-j\fR, \fB\-\-json\fR
 Emit structured RFC 8259 JSON report.
+.TP
+\fB\-\-no\-annotate\fR
+Disable automatic magic header structural annotations.
 .TP
 \fB\-\-theme\fR \fIdark|light\fR
 Select calibrated color palette (or set \fBOCTET_THEME\fR).
@@ -1393,11 +1431,20 @@ Control ANSI TrueColor output (respects \fBNO_COLOR\fR / \fBOCTET_COLOR\fR).
 \fB\-\-svg\fR \fIPATH\fR
 Render vector macOS terminal window screenshot to \fIPATH\fR.
 .TP
+\fB\-\-svg\-title\fR \fITITLE\fR
+Window title for the \fB\-\-svg\fR screenshot.
+.TP
 \fB\-\-completions\fR \fIbash|zsh|fish\fR
 Generate shell completion script.
 .TP
 \fB\-\-man\fR
 Emit this manual page in troff format.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print the version.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print usage help.
 "#,
         env!("CARGO_PKG_VERSION")
     )
