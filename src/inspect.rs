@@ -311,7 +311,7 @@ fn write_card_row(
     );
 }
 
-fn decode_uleb128(slice: &[u8]) -> Option<(u64, usize)> {
+pub(crate) fn decode_uleb128(slice: &[u8]) -> Option<(u64, usize)> {
     let mut result = 0u64;
     let mut shift = 0u32;
     for (i, &byte) in slice.iter().take(10).enumerate() {
@@ -370,23 +370,27 @@ pub fn parse_search_pattern(query: &str) -> Result<Vec<u8>> {
         .strip_prefix("0x")
         .or_else(|| query.strip_prefix("0X"))
     {
-        let clean: String = hex_str.chars().filter(|c| !c.is_whitespace()).collect();
-        if clean.is_empty() || !clean.len().is_multiple_of(2) {
+        // Decoding per char (rather than slicing the string in 2-byte steps) keeps non-ASCII
+        // input from splitting a UTF-8 sequence, and `to_digit` rejects the `+` sign that
+        // `u8::from_str_radix` would accept.
+        let mut nibbles = Vec::with_capacity(hex_str.len());
+        for c in hex_str.chars().filter(|c| !c.is_whitespace()) {
+            let digit = c.to_digit(16).ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "invalid hex digit '{c}' in search pattern '{query}'"
+                ))
+            })?;
+            nibbles.push(digit as u8);
+        }
+        if nibbles.is_empty() || !nibbles.len().is_multiple_of(2) {
             return Err(Error::InvalidArgument(format!(
                 "hex search pattern '{query}' must have an even number of hex digits"
             )));
         }
-        let mut bytes = Vec::with_capacity(clean.len() / 2);
-        for i in (0..clean.len()).step_by(2) {
-            let b = u8::from_str_radix(&clean[i..i + 2], 16).map_err(|_| {
-                Error::InvalidArgument(format!(
-                    "invalid hex byte '{}' in search pattern",
-                    &clean[i..i + 2]
-                ))
-            })?;
-            bytes.push(b);
-        }
-        Ok(bytes)
+        Ok(nibbles
+            .chunks(2)
+            .map(|pair| (pair[0] << 4) | pair[1])
+            .collect())
     } else {
         Ok(query.as_bytes().to_vec())
     }

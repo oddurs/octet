@@ -5,6 +5,8 @@
 
 use std::ops::Range;
 
+use crate::inspect::decode_uleb128;
+
 /// A single annotated structural field within a binary header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldAnnotation {
@@ -76,8 +78,8 @@ pub fn inspect_header(data: &[u8]) -> Option<HeaderInspection> {
     if data.len() >= 262 && &data[257..262] == b"ustar" {
         return Some(parse_tar(data));
     }
-    if data.starts_with(b"MZ") {
-        return Some(parse_pe_mz(data));
+    if let Some(pe) = try_parse_pe_mz(data) {
+        return Some(pe);
     }
     if data.starts_with(&[0x1f, 0x8b]) {
         return Some(parse_gzip(data));
@@ -751,10 +753,15 @@ fn parse_wasm(data: &[u8]) -> HeaderInspection {
             11 => "Data Section (11)",
             _ => "Section",
         };
+        // Section sizes are ULEB128 (up to 5 bytes for a u32), not a single byte.
+        let (range, value) = match decode_uleb128(&data[9..]) {
+            Some((size, len)) => (8..9 + len, format!("{sec_name}, payload={size} B")),
+            None => (8..9, format!("{sec_name}, payload size truncated")),
+        };
         fields.push(FieldAnnotation {
-            range: 8..10,
+            range,
             name: "WASM.section[0]",
-            value: format!("{sec_name}, payload={} B", data[9]),
+            value,
             accent_index: 2,
         });
     }
@@ -927,58 +934,83 @@ fn parse_tar(data: &[u8]) -> HeaderInspection {
     }
 }
 
-fn parse_pe_mz(data: &[u8]) -> HeaderInspection {
-    let mut fields = vec![FieldAnnotation {
-        range: 0..2,
-        name: "DOS.e_magic",
-        value: "\"MZ\" (DOS / PE Executable Header)".to_owned(),
-        accent_index: 0,
-    }];
-    let mut summary = String::from("MS-DOS / PE Executable");
+/// Recognizes a PE or MS-DOS executable. "MZ" alone is too common a prefix (plain text starts
+/// with it), so the header must also hold together: either `e_lfanew` points at a `PE\0\0`
+/// signature inside the buffer, or the DOS header fields describe a plausible image.
+fn try_parse_pe_mz(data: &[u8]) -> Option<HeaderInspection> {
+    if !data.starts_with(b"MZ") {
+        return None;
+    }
+    let lfanew = read_u32_le(data, 0x3c)?;
+    let pe_off = usize::try_from(lfanew).ok().filter(|off| off % 4 == 0);
+    let pe_sig = pe_off.filter(|&off| {
+        off.checked_add(4)
+            .is_some_and(|end| data.get(off..end) == Some(b"PE\0\0"))
+    });
+    if pe_sig.is_none() && !plausible_dos_header(data) {
+        return None;
+    }
 
-    if let Some(lfanew) = read_u32_le(data, 60) {
-        fields.push(FieldAnnotation {
-            range: 60..64,
+    let mut fields = vec![
+        FieldAnnotation {
+            range: 0..2,
+            name: "DOS.e_magic",
+            value: "\"MZ\" (DOS / PE Executable Header)".to_owned(),
+            accent_index: 0,
+        },
+        FieldAnnotation {
+            range: 0x3c..0x40,
             name: "DOS.e_lfanew",
             value: format!("0x{lfanew:08x} (PE header offset)"),
             accent_index: 1,
+        },
+    ];
+    let mut summary = String::from("MS-DOS / PE Executable");
+
+    if let Some(pe_off) = pe_sig {
+        let pe_sig_end = pe_off + 4;
+        fields.push(FieldAnnotation {
+            range: pe_off..pe_sig_end,
+            name: "PE.signature",
+            value: "\"PE\\0\\0\" (Portable Executable)".to_owned(),
+            accent_index: 2,
         });
-        if let Ok(pe_off) = usize::try_from(lfanew)
-            && let Some(pe_sig_end) = pe_off.checked_add(4)
-            && data.get(pe_off..pe_sig_end) == Some(b"PE\0\0")
-        {
+        if let Some(machine) = read_u16_le(data, pe_sig_end) {
+            let arch = match machine {
+                0x8664 => "x86_64 (AMD64)",
+                0xaa64 => "ARM64",
+                0x014c => "x86 (i386)",
+                _ => "COFF Machine",
+            };
+            summary = format!("Windows Portable Executable ({arch})");
             fields.push(FieldAnnotation {
-                range: pe_off..pe_sig_end,
-                name: "PE.signature",
-                value: "\"PE\\0\\0\" (Portable Executable)".to_owned(),
-                accent_index: 2,
+                range: pe_sig_end..pe_sig_end + 2,
+                name: "COFF.Machine",
+                value: format!("{arch} (0x{machine:04x})"),
+                accent_index: 3,
             });
-            if let Some(coff_end) = pe_sig_end.checked_add(2)
-                && let Some(machine) = read_u16_le(data, pe_sig_end)
-            {
-                let arch = match machine {
-                    0x8664 => "x86_64 (AMD64)",
-                    0xaa64 => "ARM64",
-                    0x014c => "x86 (i386)",
-                    _ => "COFF Machine",
-                };
-                summary = format!("Windows Portable Executable ({arch})");
-                fields.push(FieldAnnotation {
-                    range: pe_sig_end..coff_end,
-                    name: "COFF.Machine",
-                    value: format!("{arch} (0x{machine:04x})"),
-                    accent_index: 3,
-                });
-            }
         }
     }
 
-    HeaderInspection {
+    Some(HeaderInspection {
         format_name: "PE / MZ Executable",
         mime_or_category: "application/vnd.microsoft.portable-executable",
         summary,
         fields,
-    }
+    })
+}
+
+/// Checks the DOS header fields a real linker always fills in. Printable text after "MZ" makes
+/// `e_cblp` at least 0x2000, so it fails the first test.
+fn plausible_dos_header(data: &[u8]) -> bool {
+    let field = |off| read_u16_le(data, off).map_or(0, u32::from);
+    let bytes_in_last_page = field(2);
+    let pages = field(4);
+    let header_paragraphs = field(8);
+    bytes_in_last_page < 512
+        && pages > 0
+        && header_paragraphs >= 2
+        && header_paragraphs * 16 <= pages * 512
 }
 
 fn parse_gzip(data: &[u8]) -> HeaderInspection {
@@ -1345,7 +1377,18 @@ fn parse_pcapng(data: &[u8]) -> HeaderInspection {
         value: "0x0a0d0d0a (Section Header Block)".to_owned(),
         accent_index: 0,
     }];
-    if let Some(total_len) = read_u32_le(data, 4) {
+    // The block type is a palindrome, so only the byte-order magic tells the section's
+    // endianness; without it the length field cannot be decoded.
+    let little_endian = match read_u32_le(data, 8) {
+        Some(0x1a2b_3c4d) => Some(true),
+        Some(0x4d3c_2b1a) => Some(false),
+        _ => None,
+    };
+    let read32 = |off| match little_endian? {
+        true => read_u32_le(data, off),
+        false => read_u32_be(data, off),
+    };
+    if let Some(total_len) = read32(4) {
         fields.push(FieldAnnotation {
             range: 4..8,
             name: "SHB.total_len",
@@ -1353,11 +1396,16 @@ fn parse_pcapng(data: &[u8]) -> HeaderInspection {
             accent_index: 1,
         });
     }
-    if let Some(bom) = read_u32_le(data, 8) {
+    if let Some(raw) = read_u32_be(data, 8) {
+        let value = match little_endian {
+            Some(true) => "0x1a2b3c4d (little-endian)".to_owned(),
+            Some(false) => "0x1a2b3c4d (big-endian)".to_owned(),
+            None => format!("0x{raw:08x} (unrecognized byte-order magic)"),
+        };
         fields.push(FieldAnnotation {
             range: 8..12,
             name: "SHB.byte_order",
-            value: format!("0x{bom:08x}"),
+            value,
             accent_index: 2,
         });
     }

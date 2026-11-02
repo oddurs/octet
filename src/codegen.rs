@@ -55,8 +55,7 @@ pub fn generate_code(
     upper: bool,
 ) -> String {
     let cols = cols.max(1);
-    let base_ident = sanitize_identifier(var_name.unwrap_or("octet_data"));
-    let upper_ident = base_ident.to_ascii_uppercase();
+    let ident = identifier_for(var_name.unwrap_or("octet_data"), lang);
     let mut out = String::new();
 
     match lang {
@@ -66,42 +65,39 @@ pub fn generate_code(
                     write_hex_grid(&mut out, data, cols, upper, true, "  ", true);
                 }
             } else {
-                let _ = writeln!(out, "unsigned char {base_ident}[] = {{");
+                let _ = writeln!(out, "unsigned char {ident}[] = {{");
                 write_hex_grid(&mut out, data, cols, upper, true, "  ", true);
                 let _ = writeln!(out, "}};");
-                let _ = writeln!(out, "unsigned int {base_ident}_len = {};", data.len());
+                let _ = writeln!(out, "unsigned int {ident}_len = {};", data.len());
             }
         }
         CodeLanguage::Rust => {
-            let _ = writeln!(out, "pub const {upper_ident}: &[u8; {}] = &[", data.len());
+            let _ = writeln!(out, "pub const {ident}: &[u8; {}] = &[", data.len());
             write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
             let _ = writeln!(out, "];");
         }
         CodeLanguage::Go => {
-            let _ = writeln!(out, "var {base_ident} = []byte{{");
+            let _ = writeln!(out, "var {ident} = []byte{{");
             write_hex_grid(&mut out, data, cols, upper, false, "\t", false);
             let _ = writeln!(out, "}}");
         }
         CodeLanguage::Python => {
-            let _ = writeln!(out, "{upper_ident} = bytes([");
+            let _ = writeln!(out, "{ident} = bytes([");
             write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
             let _ = writeln!(out, "])");
         }
         CodeLanguage::TypeScript => {
-            let _ = writeln!(out, "export const {upper_ident} = new Uint8Array([");
+            let _ = writeln!(out, "export const {ident} = new Uint8Array([");
             write_hex_grid(&mut out, data, cols, upper, false, "  ", false);
             let _ = writeln!(out, "]);");
         }
         CodeLanguage::Zig => {
-            let _ = writeln!(out, "pub const {base_ident} = [_]u8{{");
+            let _ = writeln!(out, "pub const {ident} = [_]u8{{");
             write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
             let _ = writeln!(out, "}};");
         }
         CodeLanguage::CSharp => {
-            let _ = writeln!(
-                out,
-                "public static readonly byte[] {upper_ident} = new byte[] {{"
-            );
+            let _ = writeln!(out, "public static readonly byte[] {ident} = new byte[] {{");
             write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
             let _ = writeln!(out, "}};");
         }
@@ -144,12 +140,38 @@ fn write_hex_grid(
     }
 }
 
-fn sanitize_identifier(raw: &str) -> String {
+/// Derives the declared name for `lang`: sanitized, upper-cased where the language convention
+/// is a constant, and suffixed with `_` when it would collide with a reserved word.
+fn identifier_for(raw: &str, lang: CodeLanguage) -> String {
+    // xxd prefixes a leading digit with "__", so C output keeps that for `-i` parity.
+    let digit_prefix = if lang == CodeLanguage::C { "__" } else { "_" };
+    let mut ident = sanitize_identifier(raw, digit_prefix);
+    let reserved = match lang {
+        CodeLanguage::C => C_RESERVED.contains(&ident.as_str()),
+        CodeLanguage::Go => GO_RESERVED.contains(&ident.as_str()),
+        CodeLanguage::Zig => is_zig_reserved(&ident),
+        // Every keyword in these languages contains a lower-case letter, so the upper-cased
+        // name cannot collide with one.
+        CodeLanguage::Rust
+        | CodeLanguage::Python
+        | CodeLanguage::TypeScript
+        | CodeLanguage::CSharp => {
+            ident.make_ascii_uppercase();
+            false
+        }
+    };
+    if reserved {
+        ident.push('_');
+    }
+    ident
+}
+
+fn sanitize_identifier(raw: &str, digit_prefix: &str) -> String {
     let mut s = String::with_capacity(raw.len());
     for (i, ch) in raw.chars().enumerate() {
         if ch.is_ascii_alphanumeric() || ch == '_' {
             if i == 0 && ch.is_ascii_digit() {
-                s.push('_');
+                s.push_str(digit_prefix);
             }
             s.push(ch);
         } else {
@@ -161,4 +183,284 @@ fn sanitize_identifier(raw: &str) -> String {
     } else {
         s
     }
+}
+
+/// C and C++ keywords (C23 and C++23), since `-i c` output is also pasted into C++ sources,
+/// plus `main`, which C++ rejects and C makes undefined behavior as a variable.
+const C_RESERVED: &[&str] = &[
+    "alignas",
+    "alignof",
+    "and",
+    "and_eq",
+    "asm",
+    "auto",
+    "bitand",
+    "bitor",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "char8_t",
+    "char16_t",
+    "char32_t",
+    "class",
+    "co_await",
+    "co_return",
+    "co_yield",
+    "compl",
+    "concept",
+    "const",
+    "const_cast",
+    "consteval",
+    "constexpr",
+    "constinit",
+    "continue",
+    "decltype",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "dynamic_cast",
+    "else",
+    "enum",
+    "explicit",
+    "export",
+    "extern",
+    "false",
+    "float",
+    "for",
+    "friend",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "main",
+    "mutable",
+    "namespace",
+    "new",
+    "noexcept",
+    "not",
+    "not_eq",
+    "nullptr",
+    "operator",
+    "or",
+    "or_eq",
+    "private",
+    "protected",
+    "public",
+    "register",
+    "reinterpret_cast",
+    "requires",
+    "restrict",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "static_assert",
+    "static_cast",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "thread_local",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typeid",
+    "typename",
+    "typeof",
+    "typeof_unqual",
+    "union",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "wchar_t",
+    "while",
+    "xor",
+    "xor_eq",
+    "_Alignas",
+    "_Alignof",
+    "_Atomic",
+    "_BitInt",
+    "_Bool",
+    "_Complex",
+    "_Decimal128",
+    "_Decimal32",
+    "_Decimal64",
+    "_Generic",
+    "_Imaginary",
+    "_Noreturn",
+    "_Static_assert",
+    "_Thread_local",
+];
+
+/// Go keywords plus predeclared identifiers: shadowing `byte` breaks the `[]byte` literal
+/// itself, and shadowing the rest breaks any code in the same package that uses them. `init`
+/// and `main` cannot be declared as package-level variables.
+const GO_RESERVED: &[&str] = &[
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
+    "any",
+    "bool",
+    "byte",
+    "comparable",
+    "complex64",
+    "complex128",
+    "error",
+    "float32",
+    "float64",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "rune",
+    "string",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uintptr",
+    "true",
+    "false",
+    "iota",
+    "nil",
+    "append",
+    "cap",
+    "clear",
+    "close",
+    "complex",
+    "copy",
+    "delete",
+    "imag",
+    "len",
+    "make",
+    "max",
+    "min",
+    "new",
+    "panic",
+    "print",
+    "println",
+    "real",
+    "recover",
+    "init",
+    "main",
+];
+
+/// Zig keywords and primitive names; Zig rejects any declaration that shadows a primitive.
+const ZIG_RESERVED: &[&str] = &[
+    "addrspace",
+    "align",
+    "allowzero",
+    "and",
+    "anyframe",
+    "anytype",
+    "asm",
+    "break",
+    "callconv",
+    "catch",
+    "comptime",
+    "const",
+    "continue",
+    "defer",
+    "else",
+    "enum",
+    "errdefer",
+    "error",
+    "export",
+    "extern",
+    "fn",
+    "for",
+    "if",
+    "inline",
+    "linksection",
+    "noalias",
+    "noinline",
+    "nosuspend",
+    "opaque",
+    "or",
+    "orelse",
+    "packed",
+    "pub",
+    "resume",
+    "return",
+    "struct",
+    "suspend",
+    "switch",
+    "test",
+    "threadlocal",
+    "try",
+    "union",
+    "unreachable",
+    "usingnamespace",
+    "var",
+    "volatile",
+    "while",
+    "anyerror",
+    "anyopaque",
+    "bool",
+    "c_char",
+    "c_int",
+    "c_long",
+    "c_longdouble",
+    "c_longlong",
+    "c_short",
+    "c_uint",
+    "c_ulong",
+    "c_ulonglong",
+    "c_ushort",
+    "comptime_float",
+    "comptime_int",
+    "f16",
+    "f32",
+    "f64",
+    "f80",
+    "f128",
+    "false",
+    "isize",
+    "noreturn",
+    "null",
+    "true",
+    "type",
+    "undefined",
+    "usize",
+    "void",
+];
+
+fn is_zig_reserved(s: &str) -> bool {
+    // `u0`..`u65535` and `i0`..`i65535` are all primitive integer types.
+    let arbitrary_int = s
+        .strip_prefix(['u', 'i'])
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    arbitrary_int || ZIG_RESERVED.contains(&s)
 }
