@@ -320,15 +320,32 @@ fn test_hexdump_canonical_mode_reference_parity() {
         &["-C", "-s", "8", "-n", "19"],
     ];
 
+    let tmp_path = std::env::temp_dir().join("octet_hexdump_parity_sample.bin");
+    let path_str = tmp_path.to_str().unwrap();
+
     for (name, payload) in reference_corpora() {
+        std::fs::write(&tmp_path, &payload).expect("write temp hexdump sample");
         for &flags in flag_sets {
             if flags.contains(&"-s") && payload.len() < 8 {
                 continue;
             }
-            let expected = run_with_stdin("/usr/bin/hexdump", flags, &payload);
-            let mut octet_args = vec!["--color=never"];
-            octet_args.extend_from_slice(flags);
-            let actual = run_with_stdin(octet_bin(), &octet_args, &payload);
+            let (expected, actual) = if flags.contains(&"-s") {
+                let mut hd_args = flags.to_vec();
+                hd_args.push(path_str);
+                let exp = run_with_stdin("/usr/bin/hexdump", &hd_args, &[]);
+
+                let mut oc_args = vec!["--color=never"];
+                oc_args.extend_from_slice(flags);
+                oc_args.push(path_str);
+                let act = run_with_stdin(octet_bin(), &oc_args, &[]);
+                (exp, act)
+            } else {
+                let exp = run_with_stdin("/usr/bin/hexdump", flags, &payload);
+                let mut oc_args = vec!["--color=never"];
+                oc_args.extend_from_slice(flags);
+                let act = run_with_stdin(octet_bin(), &oc_args, &payload);
+                (exp, act)
+            };
 
             assert_eq!(
                 String::from_utf8_lossy(&actual),
@@ -337,6 +354,7 @@ fn test_hexdump_canonical_mode_reference_parity() {
             );
         }
     }
+    let _ = std::fs::remove_file(&tmp_path);
 }
 
 #[test]
