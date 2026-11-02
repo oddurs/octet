@@ -2,7 +2,7 @@
 name = "octet-cli"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 authors = ["The Octet Authors"]
 description = "Information-design-first hex viewer, binary inspector, and modern xxd / hexdump replacement."
 license = "MIT OR Apache-2.0"

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/oddurs/octet/actions/workflows/ci.yml/badge.svg)](https://github.com/oddurs/octet/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/octet-cli.svg)](https://crates.io/crates/octet-cli)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/octet-cli.svg)](#license)
 
 **Information-design-first hex viewer, binary inspector, and modern `xxd` / `hexdump` alternative.**
 
@@ -142,10 +142,22 @@ git config core.hooksPath .githooks
 
 # Run all checks
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
+
+The minimum supported Rust version is 1.88.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
+any additional terms or conditions.

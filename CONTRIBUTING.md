@@ -1,6 +1,6 @@
 # Contributing to `octet`
 
-Thank you for contributing to `octet`! This repository adheres to the **Google Rust Style Guide** and uses automated Git hooks to keep the codebase clean.
+Thank you for contributing to `octet`! Formatting is `rustfmt` with the repository's `rustfmt.toml`; Git hooks run the same checks as CI.
 
 ## Local Setup
 
@@ -17,8 +17,8 @@ Before opening a pull request, ensure all checks pass:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
-cargo doc --no-deps
+cargo test
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
 ## Commit Message Convention
@@ -31,3 +31,7 @@ We follow [Conventional Commits](https://www.conventionalcommits.org/):
 - `refactor:` — Code restructuring without behavior change
 - `test:` — Adding or updating tests
 - `ci:` / `chore:` — Build, CI, or tooling updates
+
+## License
+
+Contributions are dual-licensed under MIT OR Apache-2.0, matching the project.
