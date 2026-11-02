@@ -13,6 +13,7 @@
 //! - Multi-language byte array code generation ([`codegen`])
 //! - Round-trip reverse hex-to-binary conversion ([`reverse`])
 //! - Side-by-side binary diffing ([`diff`])
+//! - Bounded-memory streaming of the `xxd`/`hexdump` views and code generation ([`stream`])
 //! - Multi-type value inspection and pattern search ([`inspect`])
 //! - Grid-locked vector terminal SVG rendering ([`svg`])
 //!
@@ -46,13 +47,16 @@ pub mod format;
 pub mod inspect;
 pub mod magic;
 pub mod reverse;
+pub mod stream;
 pub mod svg;
 pub mod theme;
 mod width;
 
 pub use crate::classify::{ByteClass, ByteStats, classify_slice, compute_entropy};
 pub use crate::codegen::{CodeLanguage, generate_code};
-pub use crate::diff::{DiffReport, DiffRow, compute_diff, render_diff_ansi, render_diff_json};
+pub use crate::diff::{
+    Diff, DiffReport, DiffRow, compute_diff, render_diff_ansi, render_diff_json,
+};
 pub use crate::error::{Error, Result};
 pub use crate::format::{
     AnalyzedBuffer, DisplayRow, FormatOptions, Radix, ViewStyle, analyze_buffer, render_dump,
@@ -64,6 +68,7 @@ pub use crate::inspect::{
 };
 pub use crate::magic::{FieldAnnotation, HeaderInspection, inspect_header};
 pub use crate::reverse::{reverse_dump, strip_ansi};
+pub use crate::stream::{can_stream, stream_code, stream_dump};
 pub use crate::svg::render_ansi_to_svg;
 pub use crate::theme::{ColorMode, Rgb, Theme, ThemeVariant};
 

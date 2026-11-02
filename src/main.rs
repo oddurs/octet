@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use octet::{
-    CodeLanguage, ColorMode, Error, FormatOptions, Radix, Result, Theme, ValueInspection,
-    ViewStyle, compute_diff, extract_strings, find_pattern_spans, generate_code, parse_byte_count,
+    CodeLanguage, ColorMode, Diff, Error, FormatOptions, Radix, Result, Theme, ValueInspection,
+    ViewStyle, can_stream, extract_strings, find_pattern_spans, generate_code, parse_byte_count,
     parse_search_pattern, render_ansi_to_svg, render_diff_ansi, render_diff_json, render_dump,
-    render_json_report, render_strings_ansi, render_strings_json, reverse_dump,
+    render_json_report, render_strings_ansi, render_strings_json, reverse_dump, stream_code,
+    stream_dump,
 };
 
 fn main() -> ExitCode {
@@ -251,18 +252,18 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
     let color = cfg.color_mode.is_enabled(output_is_tty) || cfg.svg_out.is_some();
 
     if cfg.reverse {
-        let raw_input = read_input_window(cfg.input_path.as_deref(), None, None)?.0;
+        let raw_input = open_input(cfg.input_path.as_deref(), None, None)?.read_all()?;
         let text = String::from_utf8_lossy(&raw_input);
         let bytes = reverse_dump(&text, cfg.style == ViewStyle::Plain)?;
         write_output(cfg.output_path.as_deref(), &bytes)?;
         return Ok(());
     }
 
-    let (sliced_vec, start_off) =
-        read_input_window(cfg.input_path.as_deref(), cfg.seek.as_deref(), cfg.length)?;
-    let sliced = sliced_vec.as_slice();
+    let input = open_input(cfg.input_path.as_deref(), cfg.seek.as_deref(), cfg.length)?;
+    let start_off = input.start;
     let base_disp_offset = start_off.wrapping_add(cfg.display_offset.unwrap_or(0));
     let input_label = cfg.input_path.as_deref().map(display_name);
+    let out_path = cfg.output_path.as_deref();
 
     // Code generation mode (`-i` / `--include` or `--lang`)
     if cfg.include_codegen {
@@ -270,48 +271,62 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
         let cols = cfg.cols_or(default_cols);
         let input_name = cfg.input_path.as_ref().map(|p| p.to_string_lossy());
         let var_name = cfg.codegen_name.as_deref().or(input_name.as_deref());
-        let code = generate_code(sliced, var_name, cfg.codegen_lang, cols, cfg.upper_hex);
-        if let Some(ref svg_path) = cfg.svg_out {
-            let styled = style_code_for_svg(&code, &cfg.theme, color);
-            let title = cfg.svg_title.as_deref().unwrap_or("octet -i");
-            let svg_doc = render_ansi_to_svg(&styled, title, &cfg.theme);
-            fs::write(svg_path, svg_doc)?;
-        }
-        write_output(cfg.output_path.as_deref(), code.as_bytes())?;
-        return Ok(());
+        let Some(ref svg_path) = cfg.svg_out else {
+            return with_output(out_path, |out| {
+                stream_code(
+                    input.reader,
+                    out,
+                    var_name,
+                    cfg.codegen_lang,
+                    cols,
+                    cfg.upper_hex,
+                )
+            });
+        };
+        let data = input.read_all()?;
+        let code = generate_code(&data, var_name, cfg.codegen_lang, cols, cfg.upper_hex);
+        let styled = style_code_for_svg(&code, &cfg.theme, color);
+        let title = cfg.svg_title.as_deref().unwrap_or("octet -i");
+        let svg_doc = render_ansi_to_svg(&styled, title, &cfg.theme);
+        fs::write(svg_path, svg_doc)?;
+        return write_output(out_path, code.as_bytes());
     }
 
     // Binary diff mode (`--diff <other>`)
     if let Some(ref right_path) = cfg.diff_path {
-        let (right_sliced, _) =
-            read_input_window(Some(right_path), cfg.seek.as_deref(), cfg.length)?;
+        let left = input.read_all()?;
+        let right = open_input(Some(right_path), cfg.seek.as_deref(), cfg.length)?.read_all()?;
         let cols = cfg.cols_or(8);
         let autoskip = cfg.autoskip.unwrap_or(true);
-        let report = compute_diff(sliced, &right_sliced, cols, base_disp_offset, autoskip);
+        let diff = Diff::new(&left, &right, cols, base_disp_offset, autoskip);
         let left_label = cfg.input_path.as_ref().map_or_else(
             || String::from("stdin"),
             |p| p.to_string_lossy().into_owned(),
         );
         let right_label = right_path.to_string_lossy();
         if cfg.json {
-            let json_out = render_diff_json(&report, &left_label, &right_label);
-            write_output(cfg.output_path.as_deref(), json_out.as_bytes())?;
-            return Ok(());
+            let json_out = render_diff_json(&diff.summary(), &left_label, &right_label);
+            return write_output(out_path, json_out.as_bytes());
         }
+        let Some(ref svg_path) = cfg.svg_out else {
+            return with_output(out_path, |out| {
+                diff.write_ansi(out, &left_label, &right_label, &cfg.theme, color)
+            });
+        };
+        let report = diff.report();
         let rendered =
             render_diff_ansi(&report, &left_label, &right_label, cols, &cfg.theme, color);
-        if let Some(ref svg_path) = cfg.svg_out {
-            let default_title = format!("octet --diff {left_label} {right_label}");
-            let title = cfg.svg_title.as_deref().unwrap_or(&default_title);
-            let svg_doc = render_ansi_to_svg(&rendered, title, &cfg.theme);
-            fs::write(svg_path, svg_doc)?;
-        }
-        write_output(cfg.output_path.as_deref(), rendered.as_bytes())?;
-        return Ok(());
+        let default_title = format!("octet --diff {left_label} {right_label}");
+        let title = cfg.svg_title.as_deref().unwrap_or(&default_title);
+        let svg_doc = render_ansi_to_svg(&rendered, title, &cfg.theme);
+        fs::write(svg_path, svg_doc)?;
+        return write_output(out_path, rendered.as_bytes());
     }
 
     // String literal extraction mode (`--strings`)
     if let Some(min_chars) = cfg.strings_min_len {
+        let data = input.read_all()?;
+        let sliced = data.as_slice();
         let label = input_label.as_deref();
         let extracted = extract_strings(sliced, min_chars, base_disp_offset);
         if cfg.json {
@@ -336,8 +351,7 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
             let svg_doc = render_ansi_to_svg(&rendered, title, &cfg.theme);
             fs::write(svg_path, svg_doc)?;
         }
-        write_output(cfg.output_path.as_deref(), rendered.as_bytes())?;
-        return Ok(());
+        return write_output(out_path, rendered.as_bytes());
     }
 
     // Standard / Smart / Classic / Plain hex or radix dump
@@ -368,14 +382,13 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
         ViewStyle::Smart | ViewStyle::Compact | ViewStyle::Canonical
     ));
 
-    let mut search_spans = Vec::new();
-    for pat_str in &cfg.search_patterns {
-        let needle = parse_search_pattern(pat_str)?;
-        search_spans.extend(find_pattern_spans(sliced, &needle));
-    }
-    search_spans.sort_by_key(|r| r.start);
+    let needles = cfg
+        .search_patterns
+        .iter()
+        .map(|p| parse_search_pattern(p))
+        .collect::<Result<Vec<_>>>()?;
 
-    let opts = FormatOptions {
+    let mut opts = FormatOptions {
         label: input_label,
         style: cfg.style,
         radix: cfg.radix,
@@ -388,10 +401,43 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
         // A header is only recognisable at byte 0 of the input; `-o` moves
         // the displayed addresses, not the data.
         annotate_headers: cfg.annotate_headers && start_off == 0,
-        search_spans,
+        search_spans: Vec::new(),
         theme: cfg.theme.clone(),
         color,
     };
+
+    // Asked for zero bytes, hexdump and xxd print nothing, not even the final
+    // offset line that a seek past EOF still gets. The dump sees no bytes either
+    // way, so only the requested length can tell them apart.
+    let compatible_style = matches!(
+        cfg.style,
+        ViewStyle::Canonical | ViewStyle::Classic | ViewStyle::Plain
+    );
+    let zero_length = cfg.length == Some(0) && compatible_style;
+
+    // Search highlights are colour, and their spans index the whole input.
+    let streams = can_stream(&opts)
+        && (needles.is_empty() || !color)
+        && !cfg.json
+        && cfg.svg_out.is_none()
+        && cfg.inspect_offsets.is_empty();
+    if streams {
+        if zero_length {
+            return write_output(out_path, b"");
+        }
+        return with_output(out_path, |out| stream_dump(input.reader, out, &opts));
+    }
+
+    let what = cfg
+        .input_path
+        .as_deref()
+        .map_or_else(|| String::from("stdin"), |p| format!("'{}'", p.display()));
+    let data = read_for_whole_view(input, cfg.length, &what)?;
+    let sliced = data.as_slice();
+    for needle in &needles {
+        opts.search_spans.extend(find_pattern_spans(sliced, needle));
+    }
+    opts.search_spans.sort_by_key(|r| r.start);
 
     let mut inspections = Vec::with_capacity(cfg.inspect_offsets.len());
     for insp_str in &cfg.inspect_offsets {
@@ -425,18 +471,10 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
 
     if cfg.json {
         let json_out = render_json_report(sliced, &opts, inspections.first());
-        write_output(cfg.output_path.as_deref(), json_out.as_bytes())?;
-        return Ok(());
+        return write_output(out_path, json_out.as_bytes());
     }
 
-    // Asked for zero bytes, hexdump and xxd print nothing, not even the final
-    // offset line that a seek past EOF still gets. render_dump sees an empty
-    // slice either way, so only the requested length can tell them apart.
-    let compatible_style = matches!(
-        cfg.style,
-        ViewStyle::Canonical | ViewStyle::Classic | ViewStyle::Plain
-    );
-    let mut rendered = if cfg.length == Some(0) && compatible_style {
+    let mut rendered = if zero_length {
         String::new()
     } else {
         render_dump(sliced, &opts)
@@ -455,8 +493,7 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
         fs::write(svg_path, svg_doc)?;
     }
 
-    write_output(cfg.output_path.as_deref(), rendered.as_bytes())?;
-    Ok(())
+    write_output(out_path, rendered.as_bytes())
 }
 
 /// Whether writing OUTFILE `out` would destroy the regular file `input`. A
@@ -778,94 +815,242 @@ fn parse_args(args: &[OsString]) -> Result<CliConfig> {
     Ok(cfg)
 }
 
-/// Reads the `-s`/`-l` window of `path` (stdin when `None`) and returns it
-/// with the absolute offset it starts at.
-fn read_input_window(
-    path: Option<&Path>,
-    seek_spec: Option<&str>,
-    length: Option<u64>,
-) -> Result<(Vec<u8>, u64)> {
-    let Some(path) = path else {
-        return read_stream_window(io::stdin().lock(), seek_spec, length);
+/// How an input behaves under `-s`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    /// `lseek` works and the size is true, except that Linux /proc files report 0.
+    Regular,
+    /// `lseek` works, but `stat` reports a size of 0.
+    Block,
+    /// A pipe, FIFO or socket: forward only, but it ends.
+    Pipe,
+    /// A terminal or a device such as `/dev/zero`: forward only, perhaps endless,
+    /// and Linux answers `lseek` on it with 0 whatever position was asked for.
+    Device,
+}
+
+/// An input positioned at the start of its `-s` window and limited to `-l` bytes.
+struct Input {
+    reader: Box<dyn io::Read>,
+    /// The absolute offset the window starts at.
+    start: u64,
+    kind: InputKind,
+    /// Bytes a regular file has left in the window, so that reading it whole
+    /// allocates once instead of doubling through a boxed reader.
+    expected_len: usize,
+}
+
+impl Input {
+    fn read_all(mut self) -> io::Result<Vec<u8>> {
+        let mut data = Vec::with_capacity(self.expected_len);
+        self.reader.read_to_end(&mut data)?;
+        Ok(data)
+    }
+}
+
+/// Opens `path` (stdin when `None`) at its `-s`/`-l` window.
+fn open_input(path: Option<&Path>, seek_spec: Option<&str>, length: Option<u64>) -> Result<Input> {
+    let what = path.map_or_else(|| String::from("stdin"), |p| format!("'{}'", p.display()));
+    let file = match path {
+        Some(p) => Some(File::open(p)?),
+        None => stdin_file(),
     };
-    let mut file = File::open(path)?;
-    let meta = file.metadata()?;
     let seek_spec = seek_spec.map(str::trim);
-
-    // Only a regular file has a length worth trusting; a pipe or FIFO
-    // (`/dev/stdin`, `<(…)`) reports what happens to be buffered, often 0.
-    if !meta.is_file() {
-        if let Some(spec) = seek_spec.filter(|s| !s.starts_with('-')) {
-            let pos = parse_byte_count(spec)?;
-            // Block devices can seek; when a pipe refuses, fall through and
-            // skip by reading, as xxd does.
-            if let Ok(at) = file.seek(SeekFrom::Start(pos)) {
-                return Ok((read_limited(file, length)?, at));
-            }
+    let (reader, start, kind, size) = match file {
+        Some(file) => {
+            let meta = file.metadata()?;
+            let kind = kind_of(&meta);
+            let (reader, start) = seek_file(file, meta.len(), kind, seek_spec, &what)?;
+            (reader, start, kind, meta.len())
         }
-        return read_stream_window(file, seek_spec, length);
-    }
-
-    let start = match seek_spec {
-        None => 0,
-        Some(spec) => {
-            let target = match spec.strip_prefix('-') {
-                Some(back) => meta.len().saturating_sub(parse_byte_count(back)?),
-                None => parse_byte_count(spec)?.min(meta.len()),
-            };
-            file.seek(SeekFrom::Start(target))?
+        None => {
+            let (reader, start) = seek_by_reading(Box::new(io::stdin().lock()), seek_spec)?;
+            (reader, start, InputKind::Pipe, 0)
         }
     };
-    Ok((read_limited(file, length)?, start))
-}
-
-/// Reads the `-s`/`-l` window of a stream that cannot seek: a positive seek
-/// is skipped by reading, and a seek from the end needs the whole stream.
-fn read_stream_window(
-    mut reader: impl io::Read,
-    seek_spec: Option<&str>,
-    length: Option<u64>,
-) -> Result<(Vec<u8>, u64)> {
-    let skipped = match seek_spec.map(str::trim) {
-        None => 0,
-        Some(spec) if spec.starts_with('-') => {
-            let mut full = Vec::new();
-            reader.read_to_end(&mut full)?;
-            let (sliced, off) = octet::slice_buffer(&full, Some(spec), length)?;
-            return Ok((sliced.to_vec(), off));
-        }
-        Some(spec) => {
-            let pos = parse_byte_count(spec)?;
-            io::copy(&mut reader.by_ref().take(pos), &mut io::sink())?
-        }
-    };
-    Ok((read_limited(reader, length)?, skipped))
-}
-
-fn read_limited(reader: impl io::Read, length: Option<u64>) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    reader
-        .take(length.unwrap_or(u64::MAX))
-        .read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-/// Writes to `path`, or to stdout when `None`. A closed stdout (`octet f |
-/// head`) ends output quietly, as in other Unix filters, rather than failing.
-fn write_output(path: Option<&Path>, bytes: &[u8]) -> Result<()> {
-    if let Some(p) = path {
-        fs::write(p, bytes)?;
+    let expected_len = if kind == InputKind::Regular {
+        let left = size.saturating_sub(start).min(length.unwrap_or(u64::MAX));
+        usize::try_from(left).unwrap_or(0)
     } else {
-        let stdout = io::stdout();
-        let mut writer = io::BufWriter::with_capacity(64 * 1024, stdout.lock());
-        if let Err(err) = writer.write_all(bytes).and_then(|()| writer.flush()) {
-            if err.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(());
-            }
-            return Err(Error::Io(err));
+        0
+    };
+    let reader = match length {
+        Some(len) => Box::new(reader.take(len)),
+        None => reader,
+    };
+    Ok(Input {
+        reader,
+        start,
+        kind,
+        expected_len,
+    })
+}
+
+/// Stdin as a `File`, so that it can be sized and seeked like a named input
+/// (`octet -s 100 < file`). Reading through the duplicate descriptor is safe
+/// because nothing has read from stdin's own buffer yet.
+#[cfg(unix)]
+fn stdin_file() -> Option<File> {
+    use std::os::fd::AsFd as _;
+    io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .map(File::from)
+}
+
+#[cfg(not(unix))]
+fn stdin_file() -> Option<File> {
+    None
+}
+
+fn kind_of(meta: &fs::Metadata) -> InputKind {
+    if meta.is_file() {
+        return InputKind::Regular;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        let file_type = meta.file_type();
+        if file_type.is_block_device() {
+            return InputKind::Block;
+        }
+        if file_type.is_char_device() {
+            return InputKind::Device;
         }
     }
-    Ok(())
+    InputKind::Pipe
+}
+
+fn seek_file(
+    mut file: File,
+    size: u64,
+    kind: InputKind,
+    seek_spec: Option<&str>,
+    what: &str,
+) -> Result<(Box<dyn io::Read>, u64)> {
+    let Some(spec) = seek_spec else {
+        return Ok((Box::new(file), 0));
+    };
+    match kind {
+        InputKind::Pipe => seek_by_reading(Box::new(file), Some(spec)),
+        InputKind::Device | InputKind::Block if spec.starts_with('-') => {
+            // xxd: "Sorry, cannot seek." Reading to the end of /dev/zero never returns.
+            Err(Error::InvalidOffset(format!(
+                "cannot seek {spec} from the end of {what}: a device has no end to count back from"
+            )))
+        }
+        InputKind::Device => seek_by_reading(Box::new(file), Some(spec)),
+        InputKind::Block => {
+            let at = file.seek(SeekFrom::Start(parse_byte_count(spec)?))?;
+            Ok((Box::new(file), at))
+        }
+        InputKind::Regular => {
+            if let Some(back) = spec.strip_prefix('-') {
+                let at = file.seek(SeekFrom::Start(
+                    size.saturating_sub(parse_byte_count(back)?),
+                ))?;
+                return Ok((Box::new(file), at));
+            }
+            let pos = parse_byte_count(spec)?;
+            file.seek(SeekFrom::Start(pos))?;
+            if pos <= size {
+                return Ok((Box::new(file), pos));
+            }
+            // Past the reported size is either past EOF, where hexdump shows the
+            // size as the final offset, or inside a /proc file, which reports a
+            // size of 0 whatever it holds. Only a read can tell them apart.
+            let mut probe = Vec::with_capacity(1);
+            (&mut file).take(1).read_to_end(&mut probe)?;
+            if probe.is_empty() {
+                Ok((Box::new(file), size))
+            } else {
+                Ok((Box::new(io::Cursor::new(probe).chain(file)), pos))
+            }
+        }
+    }
+}
+
+/// Applies `-s` to an input that cannot seek: a positive seek is skipped by
+/// reading, and a seek from the end reads to EOF keeping only that many bytes.
+fn seek_by_reading(
+    mut reader: Box<dyn io::Read>,
+    seek_spec: Option<&str>,
+) -> Result<(Box<dyn io::Read>, u64)> {
+    let Some(spec) = seek_spec else {
+        return Ok((reader, 0));
+    };
+    if let Some(back) = spec.strip_prefix('-') {
+        let keep = usize::try_from(parse_byte_count(back)?).unwrap_or(usize::MAX);
+        let mut tail = std::collections::VecDeque::new();
+        let mut total = 0_u64;
+        let mut chunk = vec![0_u8; 64 * 1024];
+        loop {
+            let n = match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.into()),
+            };
+            total += n as u64;
+            tail.extend(&chunk[..n]);
+            if tail.len() > keep {
+                tail.drain(..tail.len() - keep);
+            }
+        }
+        let start = total - tail.len() as u64;
+        return Ok((Box::new(io::Cursor::new(Vec::from(tail))), start));
+    }
+    let pos = parse_byte_count(spec)?;
+    let skipped = io::copy(&mut reader.by_ref().take(pos), &mut io::sink())?;
+    Ok((reader, skipped))
+}
+
+/// The most that a view needing the whole input reads from one that is not a
+/// regular file, unless `-l` says how much: such an input may never end.
+const WHOLE_VIEW_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Reads `input` for a view that needs all of it at once, stopping at
+/// [`WHOLE_VIEW_LIMIT`] when it is not a regular file and `-l` was not given.
+fn read_for_whole_view(input: Input, length: Option<u64>, what: &str) -> Result<Vec<u8>> {
+    if input.kind == InputKind::Regular || length.is_some() {
+        return Ok(input.read_all()?);
+    }
+    let mut data = Vec::new();
+    input
+        .reader
+        .take(WHOLE_VIEW_LIMIT + 1)
+        .read_to_end(&mut data)?;
+    if data.len() as u64 > WHOLE_VIEW_LIMIT {
+        data.truncate(WHOLE_VIEW_LIMIT as usize);
+        let _ = writeln!(
+            io::stderr(),
+            "octet: note: showing the first 16 MiB of {what}, which is not a regular file and \
+             may not end; pass -l to choose how much, or use --classic, -C or -p to stream all of it"
+        );
+    }
+    Ok(data)
+}
+
+/// Runs `write` against OUTFILE, or stdout when `None`, through a buffer. A
+/// closed stdout (`octet f | head`) ends output quietly, as in other Unix
+/// filters, rather than failing.
+fn with_output(
+    path: Option<&Path>,
+    write: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+) -> Result<()> {
+    let mut out: Box<dyn io::Write> = match path {
+        Some(p) => Box::new(io::BufWriter::with_capacity(64 * 1024, File::create(p)?)),
+        None => Box::new(io::BufWriter::with_capacity(64 * 1024, io::stdout().lock())),
+    };
+    match write(&mut out).and_then(|()| out.flush()) {
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        res => Ok(res?),
+    }
+}
+
+fn write_output(path: Option<&Path>, bytes: &[u8]) -> Result<()> {
+    with_output(path, |out| out.write_all(bytes))
 }
 
 fn style_code_for_svg(code: &str, theme: &Theme, color: bool) -> String {
