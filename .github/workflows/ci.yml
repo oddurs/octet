@@ -13,6 +13,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   check:
@@ -45,3 +46,6 @@ jobs:
 
       - name: Build documentation
         run: cargo doc --no-deps
+
+      - name: Verify crates.io package manifest
+        run: cargo package --list --allow-dirty

@@ -10,6 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -40,9 +41,13 @@ jobs:
       - name: Package archive
         run: |
           staging="octet-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir -p "$staging"
+          mkdir -p "$staging/man" "$staging/completions"
           cp "target/${{ matrix.target }}/release/octet" "$staging/"
-          cp README.md LICENSE "$staging/"
+          cp README.md LICENSE CHANGELOG.md "$staging/"
+          cargo run --release -- --man > "$staging/man/octet.1"
+          cargo run --release -- --completions bash > "$staging/completions/octet.bash"
+          cargo run --release -- --completions zsh > "$staging/completions/_octet"
+          cargo run --release -- --completions fish > "$staging/completions/octet.fish"
           tar -czf "${staging}.tar.gz" "$staging"
           shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
 

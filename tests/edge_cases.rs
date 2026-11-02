@@ -284,4 +284,18 @@ fn test_extended_magic_headers_and_json_report() {
     let diff_json = render_diff_json(&diff_rep, "a.pcap", "b.pcapng");
     assert!(diff_json.contains("\"mode\": \"diff\""));
     assert!(diff_json.contains("\"changed_bytes\":"));
+
+    // 6. Shell completions (`--completions bash|zsh|fish`) and manual page (`--man`)
+    let bin = env!("CARGO_BIN_EXE_octet");
+    for shell in ["bash", "zsh", "fish"] {
+        let comp = Command::new(bin)
+            .args(["--completions", shell])
+            .output()
+            .expect("run --completions");
+        assert!(comp.status.success());
+        assert!(!comp.stdout.is_empty());
+    }
+    let man = Command::new(bin).arg("--man").output().expect("run --man");
+    assert!(man.status.success());
+    assert!(String::from_utf8_lossy(&man.stdout).contains(".TH OCTET 1"));
 }

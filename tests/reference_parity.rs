@@ -28,9 +28,13 @@ fn run_with_stdin(bin: &str, args: &[&str], input: &[u8]) -> Vec<u8> {
         .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input)
-            .expect("failed to write input to child stdin");
+        if let Err(err) = stdin.write_all(input) {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "failed to write input to child stdin: {err}"
+            );
+        }
     }
 
     let output = child.wait_with_output().expect("failed to wait on child");
@@ -156,20 +160,62 @@ fn test_xxd_little_endian_and_binary_bits_parity() {
         &["-b", "-g", "2"],
     ];
 
+    let vim_le_probe =
+        String::from_utf8_lossy(&run_with_stdin("/usr/bin/xxd", &["-e"], b"A")).into_owned();
+    // GNU/Linux Vim `xxd -e` emits 3 spaces before the ASCII pane whereas macOS `tinyxxd`
+    // and `octet` emit the standard 2 spaces.
+    let is_vim_le_extra_space = vim_le_probe.contains("41                              A");
+
     for (name, payload) in reference_corpora() {
         for &flags in flag_sets {
-            let expected = run_with_stdin("/usr/bin/xxd", flags, &payload);
+            let expected_raw = run_with_stdin("/usr/bin/xxd", flags, &payload);
+            let expected_str = String::from_utf8_lossy(&expected_raw);
+            let expected_norm = if is_vim_le_extra_space && flags.contains(&"-e") {
+                normalize_vim_le_extra_space(&expected_str, flags)
+            } else {
+                expected_str.into_owned()
+            };
+
             let mut octet_args = vec!["--classic", "--color=never"];
             octet_args.extend_from_slice(flags);
             let actual = run_with_stdin(octet_bin(), &octet_args, &payload);
 
             assert_eq!(
                 String::from_utf8_lossy(&actual),
-                String::from_utf8_lossy(&expected),
+                expected_norm,
                 "mismatch vs /usr/bin/xxd on corpus '{name}' with flags {flags:?}"
             );
         }
     }
+}
+
+fn normalize_vim_le_extra_space(s: &str, flags: &[&str]) -> String {
+    let mut cols = 16usize;
+    let mut group_size = 4usize;
+    let mut i = 0;
+    while i < flags.len() {
+        if flags[i] == "-c" && i + 1 < flags.len() {
+            cols = flags[i + 1].parse().unwrap_or(16);
+        } else if flags[i] == "-g" && i + 1 < flags.len() {
+            group_size = flags[i + 1].parse().unwrap_or(4);
+        }
+        i += 1;
+    }
+    let groups = cols.div_ceil(group_size);
+    let gap_idx = 10 + groups * (group_size * 2) + groups.saturating_sub(1);
+
+    let mut out = String::with_capacity(s.len());
+    for line in s.lines() {
+        if line.len() > gap_idx + 2 && line.as_bytes().get(gap_idx) == Some(&b' ') {
+            out.push_str(&line[..gap_idx]);
+            out.push_str(&line[gap_idx + 1..]);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 #[test]

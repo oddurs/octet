@@ -42,6 +42,8 @@ fn main() -> ExitCode {
 struct CliConfig {
     help: bool,
     version: bool,
+    man: bool,
+    completions: Option<String>,
     reverse: bool,
     json: bool,
     include_codegen: bool,
@@ -91,6 +93,8 @@ impl Default for CliConfig {
         Self {
             help: false,
             version: false,
+            man: false,
+            completions: None,
             reverse: false,
             json: false,
             include_codegen: false,
@@ -143,6 +147,17 @@ fn run_cli(args: Vec<String>) -> Result<()> {
 
     if cfg.version {
         println!("octet {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    if cfg.man {
+        write_output(cfg.output_path.as_deref(), render_manpage().as_bytes())?;
+        return Ok(());
+    }
+
+    if let Some(ref shell) = cfg.completions {
+        let script = render_completions(shell)?;
+        write_output(cfg.output_path.as_deref(), script.as_bytes())?;
         return Ok(());
     }
 
@@ -232,6 +247,7 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         let needle = parse_search_pattern(pat_str)?;
         search_spans.extend(find_pattern_spans(sliced, &needle));
     }
+    search_spans.sort_by_key(|r| r.start);
 
     let label = cfg.input_path.as_ref().map(|p| {
         Path::new(p)
@@ -330,6 +346,10 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
             match key {
                 "help" => cfg.help = true,
                 "version" => cfg.version = true,
+                "man" => cfg.man = true,
+                "completions" => {
+                    cfg.completions = Some(next_val("completions")?);
+                }
                 "autoskip" => cfg.autoskip = Some(true),
                 "no-autoskip" => cfg.autoskip = Some(false),
                 "hex" | "hexadecimal" => cfg.radix = Radix::Hex,
@@ -620,8 +640,9 @@ fn write_output(path: Option<&str>, bytes: &[u8]) -> Result<()> {
     if let Some(p) = path {
         fs::write(p, bytes)?;
     } else {
-        let mut stdout = io::stdout().lock();
-        if let Err(err) = stdout.write_all(bytes) {
+        let stdout = io::stdout();
+        let mut writer = io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+        if let Err(err) = writer.write_all(bytes).and_then(|()| writer.flush()) {
             if err.kind() == io::ErrorKind::BrokenPipe {
                 return Ok(());
             }
@@ -650,6 +671,8 @@ fn suggest_long_flag(unknown: &str) -> Option<&'static str> {
     const KNOWN_FLAGS: &[&str] = &[
         "help",
         "version",
+        "man",
+        "completions",
         "autoskip",
         "no-autoskip",
         "hex",
@@ -1012,4 +1035,198 @@ fn render_help(t: &Theme, c: bool) -> String {
     }
     let _ = writeln!(out, "{bot}");
     out
+}
+
+fn render_completions(shell: &str) -> Result<String> {
+    match shell.to_ascii_lowercase().as_str() {
+        "bash" => Ok(String::from(
+            r#"_octet() {
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts="-h --help -V --version -c --cols -g --groupsize -e --little-endian -b --bits -d --decimal -O --octal -u --upper -C --canonical --classic -q --compact -p --plain -s --seek -l -n --length -o --display-offset -a --autoskip -v --no-autoskip --diff -S --search --inspect -i --include --lang --name -r --reverse -j --json --no-annotate --theme --color --svg --svg-title --completions --man"
+    case "${prev}" in
+        --theme) COMPREPLY=( $(compgen -W "dark light" -- "${cur}") ); return 0 ;;
+        --color) COMPREPLY=( $(compgen -W "auto always never" -- "${cur}") ); return 0 ;;
+        --lang) COMPREPLY=( $(compgen -W "rust c go python ts" -- "${cur}") ); return 0 ;;
+        --completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") ); return 0 ;;
+    esac
+    if [[ ${cur} == -* ]]; then
+        COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+        return 0
+    fi
+    COMPREPLY=( $(compgen -f -- "${cur}") )
+}
+complete -F _octet octet
+"#,
+        )),
+        "zsh" => Ok(String::from(
+            r#"#compdef octet
+_octet() {
+    _arguments -s \
+        '(-h --help)'{-h,--help}'[Show help information]' \
+        '(-V --version)'{-V,--version}'[Show version]' \
+        '(-c --cols)'{-c,--cols}'[Octets per row]:cols:' \
+        '(-g --groupsize)'{-g,--groupsize}'[Octets per group]:groupsize:' \
+        '(-e --little-endian)'{-e,--little-endian}'[Little-endian byte grouping]' \
+        '(-b --bits)'{-b,--bits}'[Binary digit dump]' \
+        '(-d --decimal)'{-d,--decimal}'[Unsigned decimal byte dump]' \
+        '(-O --octal)'{-O,--octal}'[Octal byte dump]' \
+        '(-u --upper)'{-u,--upper}'[Uppercase hex digits]' \
+        '(-C --canonical)'{-C,--canonical}'[Canonical hexdump -C layout]' \
+        '--classic[Strict xxd layout]' \
+        '(-q --compact)'{-q,--compact}'[Compact cardless table]' \
+        '(-p --plain)'{-p,--plain}'[Plain continuous hex stream]' \
+        '(-s --seek)'{-s,--seek}'[Seek offset]:offset:' \
+        '(-l -n --length)'{-l,-n,--length}'[Read length limit]:length:' \
+        '(-o --display-offset)'{-o,--display-offset}'[Add offset to displayed addresses]:offset:' \
+        '(-a --autoskip)'{-a,--autoskip}'[Collapse identical rows]' \
+        '(-v --no-autoskip)'{-v,--no-autoskip}'[Expand all rows]' \
+        '--diff[Side-by-side binary diff]:file:_files' \
+        '(-S --search)'{-S,--search}'[Highlight pattern]:pattern:' \
+        '--inspect[Inspect multi-type values at offset]:offset:' \
+        '(-i --include)'{-i,--include}'[Generate source array]' \
+        '--lang[Target language for codegen]:lang:(rust c go python ts)' \
+        '--name[Variable identifier for codegen]:name:' \
+        '(-r --reverse)'{-r,--reverse}'[Reverse hex dump to binary]' \
+        '(-j --json)'{-j,--json}'[Emit structured JSON report]' \
+        '--no-annotate[Disable magic header annotations]' \
+        '--theme[Select color palette]:theme:(dark light)' \
+        '--color[Control ANSI color]:mode:(auto always never)' \
+        '--svg[Render vector terminal SVG]:path:_files' \
+        '--completions[Generate shell completions]:shell:(bash zsh fish)' \
+        '--man[Render troff manual page]' \
+        '*:file:_files'
+}
+_octet "$@"
+"#,
+        )),
+        "fish" => Ok(String::from(
+            r#"complete -c octet -s h -l help -d "Show help"
+complete -c octet -s V -l version -d "Show version"
+complete -c octet -s c -l cols -r -d "Octets per row"
+complete -c octet -s g -l groupsize -r -d "Octets per group"
+complete -c octet -s e -l little-endian -d "Little-endian byte grouping"
+complete -c octet -s b -l bits -d "Binary digit dump"
+complete -c octet -s d -l decimal -d "Unsigned decimal byte dump"
+complete -c octet -s O -l octal -d "Octal byte dump"
+complete -c octet -s u -l upper -d "Uppercase hex digits"
+complete -c octet -s C -l canonical -d "Canonical hexdump -C layout"
+complete -c octet -l classic -d "Strict xxd layout"
+complete -c octet -s q -l compact -d "Compact cardless table"
+complete -c octet -s p -l plain -d "Plain continuous hex stream"
+complete -c octet -s s -l seek -r -d "Start at offset"
+complete -c octet -s l -s n -l length -r -d "Read at most N bytes"
+complete -c octet -s o -l display-offset -r -d "Add offset to displayed addresses"
+complete -c octet -s a -l autoskip -d "Collapse identical rows"
+complete -c octet -s v -l no-autoskip -d "Expand all rows"
+complete -c octet -l diff -r -F -d "Side-by-side binary diff"
+complete -c octet -s S -l search -r -d "Highlight pattern"
+complete -c octet -l inspect -r -d "Inspect values at offset"
+complete -c octet -s i -l include -d "Generate source code array"
+complete -c octet -l lang -r -a "rust c go python ts" -d "Codegen language"
+complete -c octet -s r -l reverse -d "Reverse hex dump to binary"
+complete -c octet -s j -l json -d "Emit structured JSON report"
+complete -c octet -l no-annotate -d "Disable magic header annotations"
+complete -c octet -l theme -r -a "dark light" -d "Color palette"
+complete -c octet -l color -r -a "auto always never" -d "Color mode"
+complete -c octet -l svg -r -F -d "Render vector SVG screenshot"
+complete -c octet -l completions -r -a "bash zsh fish" -d "Generate shell completions"
+complete -c octet -l man -d "Render troff manual page"
+"#,
+        )),
+        other => Err(Error::InvalidArgument(format!(
+            "unsupported shell '{other}' for --completions (expected bash, zsh, or fish)"
+        ))),
+    }
+}
+
+fn render_manpage() -> String {
+    format!(
+        r#".TH OCTET 1 "2026" "octet {}" "User Commands"
+.SH NAME
+octet \- information-design-first hex viewer, binary inspector, and xxd / hexdump replacement
+.SH SYNOPSIS
+.B octet
+[\fIOPTIONS\fR] [\fIINFILE\fR [\fIOUTFILE\fR]]
+.SH DESCRIPTION
+.B octet
+is a modern, zero-dependency hexadecimal and multi-radix binary viewer engineered around visual hierarchy, semantic 7-class byte typography, automatic structural header recognition (31+ binary formats), side-by-side binary diffing, multi-type value inspection, multi-language code generation, and round-trip hex-to-binary reversal.
+.SH OPTIONS
+.TP
+\fB\-c\fR, \fB\-\-cols\fR \fIN\fR
+Format \fIN\fR octets per row (default: 16, binary: 6, plain: 30, max: 256).
+.TP
+\fB\-g\fR, \fB\-\-groupsize\fR \fIN\fR
+Group \fIN\fR octets per space-separated block (default: 2, \-e: 4).
+.TP
+\fB\-e\fR, \fB\-\-little\-endian\fR
+Little-endian byte grouping (compatible with \fBxxd \-e\fR).
+.TP
+\fB\-b\fR, \fB\-\-bits\fR
+Binary digit dump (01000001) instead of hexadecimal.
+.TP
+\fB\-d\fR, \fB\-\-decimal\fR / \fB\-O\fR, \fB\-\-octal\fR
+Render bytes as 3-digit unsigned decimal or octal.
+.TP
+\fB\-u\fR, \fB\-\-upper\fR
+Use uppercase hexadecimal digits (00..FF).
+.TP
+\fB\-C\fR, \fB\-\-canonical\fR
+Canonical BSD/GNU \fBhexdump \-C\fR layout.
+.TP
+\fB\-\-classic\fR / \fB\-q\fR, \fB\-\-compact\fR
+Strict \fBxxd\fR layout (\fB\-\-classic\fR) or cardless compact table (\fB\-q\fR).
+.TP
+\fB\-p\fR, \fB\-\-plain\fR
+Continuous plain hexadecimal stream (\fBxxd \-p\fR).
+.TP
+\fB\-s\fR, \fB\-\-seek\fR [\fI+-\fR]\fIOFFSET\fR
+Start at \fIOFFSET\fR (supports hex 0x100, 4KiB, or \-0x40 from EOF).
+.TP
+\fB\-l\fR, \fB\-n\fR, \fB\-\-length\fR \fILEN\fR
+Read at most \fILEN\fR bytes.
+.TP
+\fB\-o\fR, \fB\-\-display\-offset\fR \fIOFF\fR
+Add \fIOFF\fR to displayed row addresses.
+.TP
+\fB\-a\fR, \fB\-\-autoskip\fR / \fB\-v\fR, \fB\-\-no\-autoskip\fR
+Collapse or expand consecutive identical/zero rows.
+.TP
+\fB\-\-diff\fR \fIFILE\fR
+Side-by-side binary delta comparison against \fIFILE\fR.
+.TP
+\fB\-S\fR, \fB\-\-search\fR \fIPATTERN\fR
+Highlight ASCII text or hex sequence (e.g. \fB\-S 'ELF'\fR or \fB\-S 0xfeedfacf\fR).
+.TP
+\fB\-\-inspect\fR \fIOFFSET\fR
+Decode u8/i8/u16/u32/u64/f32/f64/ULEB128/UTF-8 at \fIOFFSET\fR.
+.TP
+\fB\-i\fR, \fB\-\-include\fR [\fB\-\-lang\fR \fIL\fR]
+Emit source array in rust, c (default), go, python, or ts.
+.TP
+\fB\-r\fR, \fB\-\-reverse\fR
+Reverse hex dump (octet, xxd, hexdump \-C, or \-r \-p) back to binary.
+.TP
+\fB\-j\fR, \fB\-\-json\fR
+Emit structured RFC 8259 JSON report.
+.TP
+\fB\-\-theme\fR \fIdark|light\fR
+Select calibrated color palette (or set \fBOCTET_THEME\fR).
+.TP
+\fB\-\-color\fR \fIauto|always|never\fR
+Control ANSI TrueColor output (respects \fBNO_COLOR\fR / \fBOCTET_COLOR\fR).
+.TP
+\fB\-\-svg\fR \fIPATH\fR
+Render vector macOS terminal window screenshot to \fIPATH\fR.
+.TP
+\fB\-\-completions\fR \fIbash|zsh|fish\fR
+Generate shell completion script.
+.TP
+\fB\-\-man\fR
+Emit this manual page in troff format.
+"#,
+        env!("CARGO_PKG_VERSION")
+    )
 }

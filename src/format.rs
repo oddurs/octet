@@ -215,9 +215,9 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
     }
 
     let analyzed = analyze_buffer(data, opts);
-    let mut out = String::new();
     let off_w = compute_offset_width(data.len(), opts.display_offset);
     let card_width = compute_card_width(opts, off_w);
+    let mut out = String::with_capacity(analyzed.rows.len() * (card_width + 64) + 1024);
 
     if opts.style == ViewStyle::Smart {
         render_header_banner(&mut out, &analyzed, opts, card_width, off_w);
@@ -792,10 +792,20 @@ fn build_row_context_note(
     let t = &opts.theme;
     let row_range = start_index..start_index + bytes.len();
 
-    // 1. Search match in this row
+    // 1. Search match in this row (using partition_point when sorted, with linear fallback)
+    let first_cand = opts
+        .search_spans
+        .partition_point(|r| r.end <= row_range.start);
+    if let Some(span) = opts.search_spans.get(first_cand)
+        && span.start < row_range.end
+        && span.end > row_range.start
+    {
+        let match_off = opts.display_offset.saturating_add(span.start as u64);
+        return (format!("★ match @ 0x{match_off:02x}"), t.byte_control, true);
+    }
     for span in &opts.search_spans {
         if span.start < row_range.end && span.end > row_range.start {
-            let match_off = opts.display_offset + span.start as u64;
+            let match_off = opts.display_offset.saturating_add(span.start as u64);
             return (format!("★ match @ 0x{match_off:02x}"), t.byte_control, true);
         }
     }
@@ -989,8 +999,13 @@ fn style_byte_token(
     if !color {
         return text.to_owned();
     }
-    // Search highlight takes visual priority.
-    if search_spans.iter().any(|r| r.contains(&abs_idx)) {
+    // Search highlight takes visual priority (fast binary search when sorted).
+    let cand_idx = search_spans.partition_point(|r| r.end <= abs_idx);
+    let is_search_hit = search_spans
+        .get(cand_idx)
+        .is_some_and(|r| r.contains(&abs_idx))
+        || (search_spans.len() <= 8 && search_spans.iter().any(|r| r.contains(&abs_idx)));
+    if is_search_hit {
         return format!(
             "\x1b[1m{}{}{text}\x1b[0m",
             theme.search_bg.ansi_bg(),

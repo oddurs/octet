@@ -15,6 +15,28 @@
 //! - Side-by-side binary diffing ([`diff`])
 //! - Multi-type value inspection and pattern search ([`inspect`])
 //! - Grid-locked vector terminal SVG rendering ([`svg`])
+//!
+//! # Quick Start
+//!
+//! ```rust
+//! use octet::{FormatOptions, ViewStyle, inspect_header, render_dump, reverse_dump};
+//!
+//! let payload = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR";
+//!
+//! // 1. Inspect structural file headers automatically
+//! let header = inspect_header(payload).expect("recognizes PNG header");
+//! assert_eq!(header.format_name, "PNG Image");
+//!
+//! // 2. Format a hex dump and round-trip reverse it back to raw bytes
+//! let opts = FormatOptions {
+//!     style: ViewStyle::Smart,
+//!     color: false,
+//!     ..FormatOptions::default()
+//! };
+//! let dump = render_dump(payload, &opts);
+//! let restored = reverse_dump(&dump, false).expect("round-trip reverse");
+//! assert_eq!(restored, payload);
+//! ```
 
 pub mod classify;
 pub mod codegen;
