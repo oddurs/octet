@@ -111,7 +111,8 @@ pub fn compute_diff(
                     rows.push(DiffRow::Elided {
                         start_offset: raw_rows[i].0,
                         row_count: count,
-                        byte_count: count * cols,
+                        // The final row of the longer buffer may be short.
+                        byte_count: (elide_until * cols).min(max_len) - i * cols,
                     });
                     i = elide_until;
                     continue;

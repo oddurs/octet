@@ -1,13 +1,13 @@
 // Copyright 2026 The Octet Authors.
 // Dual-licensed under MIT or Apache-2.0.
 
-//! Regression tests for `-r` row-format detection.
+//! Regression tests for `-r` row-format detection and diff elision accounting.
 
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use octet::{FormatOptions, ViewStyle, render_dump, reverse_dump};
+use octet::{DiffRow, FormatOptions, ViewStyle, compute_diff, render_dump, reverse_dump};
 
 /// Bytes whose `-g4` hex groups read as valid 8-bit binary tokens.
 const BIT_LOOKALIKE: &[u8] = b"\x00\x00\x00\x00\x01\x10\x11\x01";
@@ -67,6 +67,25 @@ fn test_reverse_hexdump_canonical_ascii_column_containing_pipe() {
 00000005
 ";
     assert_eq!(reverse_dump(dump, false).unwrap(), b"ab  |");
+}
+
+#[test]
+fn test_diff_elided_run_counts_short_final_row() {
+    let data = [0x5a_u8; 17];
+    let report = compute_diff(&data, &data, 8, 0, true);
+    let elided: Vec<(usize, usize)> = report
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            DiffRow::Elided {
+                row_count,
+                byte_count,
+                ..
+            } => Some((*row_count, *byte_count)),
+            DiffRow::Data { .. } => None,
+        })
+        .collect();
+    assert_eq!(elided, vec![(3, 17)]);
 }
 
 fn run_with_stdin(bin: &str, args: &[&str], input: &[u8]) -> Vec<u8> {
