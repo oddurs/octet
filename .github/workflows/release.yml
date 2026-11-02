@@ -52,7 +52,9 @@ jobs:
 
       - name: Package archive
         run: |
-          staging="octet-${{ github.ref_name }}-${{ matrix.target }}"
+          # A branch name from workflow_dispatch can contain '/', which would nest the archive.
+          ref="${GITHUB_REF_NAME//\//-}"
+          staging="octet-${ref}-${{ matrix.target }}"
           mkdir -p "$staging/man" "$staging/completions"
           cp "target/${{ matrix.target }}/release/octet" "$staging/"
           cp README.md LICENSE-MIT LICENSE-APACHE CHANGELOG.md "$staging/"
@@ -67,6 +69,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
+          if-no-files-found: error
           path: |
             octet-*.tar.gz
             octet-*.tar.gz.sha256
