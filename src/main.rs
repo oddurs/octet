@@ -3,10 +3,11 @@
 
 //! Command-line interface for `octet`.
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use octet::{
@@ -17,7 +18,8 @@ use octet::{
 };
 
 fn main() -> ExitCode {
-    match run_cli(std::env::args().skip(1).collect()) {
+    // `args_os`, because file names on Unix need not be UTF-8.
+    match run_cli(std::env::args_os().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let err_tty = io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
@@ -63,13 +65,13 @@ struct CliConfig {
     search_patterns: Vec<String>,
     inspect_offsets: Vec<String>,
     strings_min_len: Option<usize>,
-    diff_path: Option<String>,
-    svg_out: Option<String>,
+    diff_path: Option<PathBuf>,
+    svg_out: Option<PathBuf>,
     svg_title: Option<String>,
     theme: Theme,
     color_mode: ColorMode,
-    input_path: Option<String>,
-    output_path: Option<String>,
+    input_path: Option<PathBuf>,
+    output_path: Option<PathBuf>,
 }
 
 impl Default for CliConfig {
@@ -126,10 +128,64 @@ impl Default for CliConfig {
     }
 }
 
-fn run_cli(args: Vec<String>) -> Result<()> {
+impl CliConfig {
+    /// The row width, where `-c 0` means the mode's default, as in xxd.
+    fn cols_or(&self, default: usize) -> usize {
+        self.cols.filter(|&c| c != 0).unwrap_or(default)
+    }
+
+    /// Rejects flag combinations where one flag would silently be ignored.
+    fn check_conflicts(&self) -> Result<()> {
+        let conflict =
+            |a: &str, b: &str| Error::InvalidArgument(format!("{a} cannot be combined with {b}"));
+        let modes: Vec<&str> = [
+            ("-r/--reverse", self.reverse),
+            ("-i/--include", self.include_codegen),
+            ("--diff", self.diff_path.is_some()),
+            ("--strings", self.strings_min_len.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect();
+        if let [first, second, ..] = modes[..] {
+            return Err(conflict(first, second));
+        }
+        let mode = modes.first().copied();
+        // Reverse and codegen output are not reports, so there is no JSON form.
+        if self.json && (self.reverse || self.include_codegen) {
+            return Err(conflict("-j/--json", mode.unwrap_or_default()));
+        }
+        if self.svg_out.is_some() {
+            if self.json {
+                return Err(conflict("--svg", "-j/--json"));
+            }
+            if self.reverse {
+                return Err(conflict("--svg", "-r/--reverse"));
+            }
+        }
+        if let Some(m) = mode {
+            if !self.inspect_offsets.is_empty() {
+                return Err(conflict("--inspect", m));
+            }
+            if !self.search_patterns.is_empty() {
+                return Err(conflict("-S/--search", m));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The file name of `path` for titles and labels, lossily decoded.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn run_cli(args: Vec<OsString>) -> Result<()> {
     let mut cfg = parse_args(&args)?;
-    let is_tty = io::stdout().is_terminal();
-    let color = cfg.color_mode.is_enabled(is_tty) || cfg.svg_out.is_some();
+    let stdout_is_tty = io::stdout().is_terminal();
 
     // If invoked with no arguments in an interactive terminal, show help instead of hanging on stdin.
     if args.is_empty() && io::stdin().is_terminal() {
@@ -137,19 +193,19 @@ fn run_cli(args: Vec<String>) -> Result<()> {
     }
 
     if cfg.help {
+        let color = cfg.color_mode.is_enabled(stdout_is_tty) || cfg.svg_out.is_some();
         let help_text = render_help(&cfg.theme, color);
         if let Some(ref svg_path) = cfg.svg_out {
             let title = cfg.svg_title.as_deref().unwrap_or("octet --help");
             let svg_doc = render_ansi_to_svg(&help_text, title, &cfg.theme);
             fs::write(svg_path, svg_doc)?;
         }
-        print!("{help_text}");
-        return Ok(());
+        return write_output(None, help_text.as_bytes());
     }
 
     if cfg.version {
-        println!("octet {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        let version = format!("octet {}\n", env!("CARGO_PKG_VERSION"));
+        return write_output(None, version.as_bytes());
     }
 
     if cfg.man {
@@ -163,6 +219,12 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
+    cfg.check_conflicts()?;
+
+    // An OUTFILE is never a terminal, so `auto` leaves it plain even when stdout is one.
+    let output_is_tty = cfg.output_path.is_none() && stdout_is_tty;
+    let color = cfg.color_mode.is_enabled(output_is_tty) || cfg.svg_out.is_some();
+
     if cfg.reverse {
         let raw_input = read_input_window(cfg.input_path.as_deref(), None, None)?.0;
         let text = String::from_utf8_lossy(&raw_input);
@@ -175,12 +237,14 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         read_input_window(cfg.input_path.as_deref(), cfg.seek.as_deref(), cfg.length)?;
     let sliced = sliced_vec.as_slice();
     let base_disp_offset = start_off.wrapping_add(cfg.display_offset.unwrap_or(0));
+    let input_label = cfg.input_path.as_deref().map(display_name);
 
     // Code generation mode (`-i` / `--include` or `--lang`)
     if cfg.include_codegen {
         let default_cols = if cfg.radix == Radix::Binary { 6 } else { 12 };
-        let cols = cfg.cols.unwrap_or(default_cols);
-        let var_name = cfg.codegen_name.as_deref().or(cfg.input_path.as_deref());
+        let cols = cfg.cols_or(default_cols);
+        let input_name = cfg.input_path.as_ref().map(|p| p.to_string_lossy());
+        let var_name = cfg.codegen_name.as_deref().or(input_name.as_deref());
         let code = generate_code(sliced, var_name, cfg.codegen_lang, cols, cfg.upper_hex);
         if let Some(ref svg_path) = cfg.svg_out {
             let styled = style_code_for_svg(&code, &cfg.theme, color);
@@ -196,18 +260,23 @@ fn run_cli(args: Vec<String>) -> Result<()> {
     if let Some(ref right_path) = cfg.diff_path {
         let (right_sliced, _) =
             read_input_window(Some(right_path), cfg.seek.as_deref(), cfg.length)?;
-        let cols = cfg.cols.unwrap_or(8);
+        let cols = cfg.cols_or(8);
         let autoskip = cfg.autoskip.unwrap_or(true);
         let report = compute_diff(sliced, &right_sliced, cols, base_disp_offset, autoskip);
-        let left_label = cfg.input_path.as_deref().unwrap_or("stdin");
+        let left_label = cfg.input_path.as_ref().map_or_else(
+            || String::from("stdin"),
+            |p| p.to_string_lossy().into_owned(),
+        );
+        let right_label = right_path.to_string_lossy();
         if cfg.json {
-            let json_out = render_diff_json(&report, left_label, right_path);
+            let json_out = render_diff_json(&report, &left_label, &right_label);
             write_output(cfg.output_path.as_deref(), json_out.as_bytes())?;
             return Ok(());
         }
-        let rendered = render_diff_ansi(&report, left_label, right_path, cols, &cfg.theme, color);
+        let rendered =
+            render_diff_ansi(&report, &left_label, &right_label, cols, &cfg.theme, color);
         if let Some(ref svg_path) = cfg.svg_out {
-            let default_title = format!("octet --diff {left_label} {right_path}");
+            let default_title = format!("octet --diff {left_label} {right_label}");
             let title = cfg.svg_title.as_deref().unwrap_or(&default_title);
             let svg_doc = render_ansi_to_svg(&rendered, title, &cfg.theme);
             fs::write(svg_path, svg_doc)?;
@@ -218,12 +287,7 @@ fn run_cli(args: Vec<String>) -> Result<()> {
 
     // String literal extraction mode (`--strings`)
     if let Some(min_chars) = cfg.strings_min_len {
-        let label = cfg.input_path.as_ref().map(|p| {
-            Path::new(p)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(p)
-        });
+        let label = input_label.as_deref();
         let extracted = extract_strings(sliced, min_chars, base_disp_offset);
         if cfg.json {
             let json_out = render_strings_json(&extracted, sliced.len(), min_chars, label);
@@ -252,15 +316,15 @@ fn run_cli(args: Vec<String>) -> Result<()> {
     }
 
     // Standard / Smart / Classic / Plain hex or radix dump
-    let default_cols = if cfg.style == ViewStyle::Plain {
-        30
+    let cols = if cfg.style == ViewStyle::Plain {
+        // Plain mode keeps 0: like `xxd -p -c 0`, it prints one unbroken line.
+        cfg.cols.unwrap_or(30)
     } else {
-        match cfg.radix {
+        cfg.cols_or(match cfg.radix {
             Radix::Binary => 6,
             Radix::Hex | Radix::Octal | Radix::Decimal => 16,
-        }
+        })
     };
-    let cols = cfg.cols.unwrap_or(default_cols);
     let default_group = match cfg.radix {
         Radix::Binary | Radix::Octal | Radix::Decimal => 1,
         Radix::Hex => {
@@ -286,16 +350,8 @@ fn run_cli(args: Vec<String>) -> Result<()> {
     }
     search_spans.sort_by_key(|r| r.start);
 
-    let label = cfg.input_path.as_ref().map(|p| {
-        Path::new(p)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(p)
-            .to_owned()
-    });
-
     let opts = FormatOptions {
-        label,
+        label: input_label,
         style: cfg.style,
         radix: cfg.radix,
         cols,
@@ -323,8 +379,12 @@ fn run_cli(args: Vec<String>) -> Result<()> {
             }
             sliced.len() - back
         } else {
-            let target_off = parse_byte_count(trimmed)?;
-            usize::try_from(target_off.saturating_sub(base_disp_offset)).unwrap_or(usize::MAX)
+            // An offset before the window is as out of range as one past
+            // its end; usize::MAX makes `ValueInspection::at` reject it.
+            parse_byte_count(trimmed)?
+                .checked_sub(base_disp_offset)
+                .and_then(|rel| usize::try_from(rel).ok())
+                .unwrap_or(usize::MAX)
         };
         if let Some(insp) = ValueInspection::at(sliced, rel_idx, base_disp_offset) {
             inspections.push(insp);
@@ -342,14 +402,25 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let mut rendered = render_dump(sliced, &opts);
+    // Asked for zero bytes, hexdump and xxd print nothing, not even the final
+    // offset line that a seek past EOF still gets. render_dump sees an empty
+    // slice either way, so only the requested length can tell them apart.
+    let compatible_style = matches!(
+        cfg.style,
+        ViewStyle::Canonical | ViewStyle::Classic | ViewStyle::Plain
+    );
+    let mut rendered = if cfg.length == Some(0) && compatible_style {
+        String::new()
+    } else {
+        render_dump(sliced, &opts)
+    };
     for insp in &inspections {
         rendered.push_str(&insp.render_ansi(&cfg.theme, color));
     }
 
     if let Some(ref svg_path) = cfg.svg_out {
         let default_title = match cfg.input_path.as_deref() {
-            Some(p) => format!("octet {p}"),
+            Some(p) => format!("octet {}", p.to_string_lossy()),
             None => String::from("octet"),
         };
         let title = cfg.svg_title.as_deref().unwrap_or(&default_title);
@@ -361,133 +432,165 @@ fn run_cli(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn parse_args(args: &[String]) -> Result<CliConfig> {
+/// Takes the value of option `flag`: its attached part when there is one,
+/// otherwise the next argument.
+fn flag_value(
+    args: &[OsString],
+    i: &mut usize,
+    inline: Option<&str>,
+    flag: &str,
+) -> Result<OsString> {
+    if let Some(v) = inline {
+        return Ok(v.into());
+    }
+    *i += 1;
+    args.get(*i)
+        .cloned()
+        .ok_or_else(|| Error::InvalidArgument(format!("option '{flag}' requires a value")))
+}
+
+/// Like [`flag_value`], for options whose value is text rather than a path.
+fn flag_text(args: &[OsString], i: &mut usize, inline: Option<&str>, flag: &str) -> Result<String> {
+    flag_value(args, i, inline, flag)?
+        .into_string()
+        .map_err(|v| {
+            Error::InvalidArgument(format!(
+                "value {v:?} for option '{flag}' is not valid UTF-8"
+            ))
+        })
+}
+
+fn parse_cols(raw: &str) -> Result<usize> {
+    let c = usize::try_from(parse_byte_count(raw)?).unwrap_or(usize::MAX);
+    if c > 256 {
+        return Err(Error::InvalidArgument(format!(
+            "column count {c} exceeds maximum supported columns (256)"
+        )));
+    }
+    Ok(c)
+}
+
+/// Applies a long flag that takes no value; returns false if `key` is not one.
+fn apply_long_switch(cfg: &mut CliConfig, key: &str) -> bool {
+    match key {
+        "help" => cfg.help = true,
+        "version" => cfg.version = true,
+        "man" => cfg.man = true,
+        "autoskip" => cfg.autoskip = Some(true),
+        "no-autoskip" => cfg.autoskip = Some(false),
+        "hex" | "hexadecimal" => cfg.radix = Radix::Hex,
+        "bits" | "binary" => cfg.radix = Radix::Binary,
+        "octal" => cfg.radix = Radix::Octal,
+        "decimal" => cfg.radix = Radix::Decimal,
+        "little-endian" | "endian" => cfg.little_endian = true,
+        "include" => cfg.include_codegen = true,
+        "plain" | "ps" | "postscript" => cfg.style = ViewStyle::Plain,
+        "compact" | "quiet" => cfg.style = ViewStyle::Compact,
+        "canonical" | "hexdump" => cfg.style = ViewStyle::Canonical,
+        "classic" | "xxd" => {
+            cfg.style = ViewStyle::Classic;
+            if cfg.autoskip.is_none() {
+                cfg.autoskip = Some(false);
+            }
+        }
+        "reverse" => cfg.reverse = true,
+        "json" => cfg.json = true,
+        "upper" | "uppercase" => cfg.upper_hex = true,
+        "no-annotate" => cfg.annotate_headers = false,
+        _ => return false,
+    }
+    true
+}
+
+fn parse_args(args: &[OsString]) -> Result<CliConfig> {
     let mut cfg = CliConfig::default();
-    let mut positional = Vec::new();
+    let mut positional: Vec<OsString> = Vec::new();
     let mut i = 0;
 
     while i < args.len() {
-        let arg = &args[i];
+        let Some(arg) = args[i].to_str() else {
+            // A non-UTF-8 argument can only be a path; options are ASCII.
+            if args[i].as_encoded_bytes().starts_with(b"-") {
+                return Err(Error::InvalidArgument(format!(
+                    "option {:?} is not valid UTF-8",
+                    args[i]
+                )));
+            }
+            positional.push(args[i].clone());
+            i += 1;
+            continue;
+        };
         if arg == "--" {
             positional.extend_from_slice(&args[i + 1..]);
             break;
         }
         if let Some(long) = arg.strip_prefix("--") {
             let (key, inline_val) = match long.split_once('=') {
-                Some((k, v)) => (k, Some(v.to_owned())),
+                Some((k, v)) => (k, Some(v)),
                 None => (long, None),
             };
-            let mut next_val = |flag_name: &str| -> Result<String> {
-                if let Some(v) = inline_val.clone() {
-                    Ok(v)
-                } else if i + 1 < args.len() {
-                    i += 1;
-                    Ok(args[i].clone())
-                } else {
-                    Err(Error::InvalidArgument(format!(
-                        "option '--{flag_name}' requires a value"
-                    )))
-                }
-            };
+            let flag = format!("--{key}");
 
             match key {
-                "help" => cfg.help = true,
-                "version" => cfg.version = true,
-                "man" => cfg.man = true,
                 "completions" => {
-                    cfg.completions = Some(next_val("completions")?);
+                    cfg.completions = Some(flag_text(args, &mut i, inline_val, &flag)?);
                 }
-                "autoskip" => cfg.autoskip = Some(true),
-                "no-autoskip" => cfg.autoskip = Some(false),
-                "hex" | "hexadecimal" => cfg.radix = Radix::Hex,
-                "bits" | "binary" => cfg.radix = Radix::Binary,
-                "octal" => cfg.radix = Radix::Octal,
-                "decimal" => cfg.radix = Radix::Decimal,
                 "cols" | "columns" => {
-                    let v = next_val("cols")?;
-                    let c = usize::try_from(parse_byte_count(&v)?).unwrap_or(usize::MAX);
-                    if c > 256 {
-                        return Err(Error::InvalidArgument(format!(
-                            "column count {c} exceeds maximum supported columns (256)"
-                        )));
-                    }
-                    cfg.cols = Some(c);
+                    cfg.cols = Some(parse_cols(&flag_text(args, &mut i, inline_val, &flag)?)?);
                 }
                 "groupsize" | "group-size" | "group" => {
-                    let v = next_val("groupsize")?;
+                    let v = flag_text(args, &mut i, inline_val, &flag)?;
                     cfg.group_size =
                         Some(usize::try_from(parse_byte_count(&v)?).unwrap_or(usize::MAX));
                 }
-                "little-endian" | "endian" => cfg.little_endian = true,
-                "include" => cfg.include_codegen = true,
                 "lang" | "language" => {
-                    let v = next_val("lang")?;
+                    let v = flag_text(args, &mut i, inline_val, &flag)?;
                     cfg.codegen_lang = CodeLanguage::parse(&v)?;
                     cfg.include_codegen = true;
                 }
                 "name" => {
-                    cfg.codegen_name = Some(next_val("name")?);
+                    cfg.codegen_name = Some(flag_text(args, &mut i, inline_val, &flag)?);
                 }
                 "length" | "len" | "bytes" => {
-                    let v = next_val("length")?;
+                    let v = flag_text(args, &mut i, inline_val, &flag)?;
                     cfg.length = Some(parse_byte_count(&v)?);
                 }
                 "seek" => {
-                    cfg.seek = Some(next_val("seek")?);
+                    cfg.seek = Some(flag_text(args, &mut i, inline_val, &flag)?);
                 }
                 "display-offset" | "offset" => {
-                    let v = next_val("display-offset")?;
+                    let v = flag_text(args, &mut i, inline_val, &flag)?;
                     cfg.display_offset = Some(parse_byte_count(&v)?);
                 }
-                "plain" | "ps" | "postscript" => cfg.style = ViewStyle::Plain,
-                "compact" | "quiet" => cfg.style = ViewStyle::Compact,
-                "canonical" | "hexdump" => cfg.style = ViewStyle::Canonical,
-                "classic" | "xxd" => {
-                    cfg.style = ViewStyle::Classic;
-                    if cfg.autoskip.is_none() {
-                        cfg.autoskip = Some(false);
-                    }
-                }
-                "reverse" => cfg.reverse = true,
-                "json" => cfg.json = true,
-                "upper" | "uppercase" => cfg.upper_hex = true,
-                "no-annotate" => cfg.annotate_headers = false,
                 "search" => {
-                    cfg.search_patterns.push(next_val("search")?);
+                    let v = flag_text(args, &mut i, inline_val, &flag)?;
+                    cfg.search_patterns.push(v);
                 }
                 "inspect" => {
-                    cfg.inspect_offsets.push(next_val("inspect")?);
+                    let v = flag_text(args, &mut i, inline_val, &flag)?;
+                    cfg.inspect_offsets.push(v);
                 }
                 "strings" => {
-                    let min_len = if let Some(ref v) = inline_val {
-                        usize::try_from(parse_byte_count(v)?).unwrap_or(4).max(1)
-                    } else if i + 1 < args.len()
-                        && args[i + 1]
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_digit())
-                        && args.len().saturating_sub(i + 2) >= 1
-                    {
-                        i += 1;
-                        usize::try_from(parse_byte_count(&args[i])?)
-                            .unwrap_or(4)
-                            .max(1)
-                    } else {
-                        4
+                    // The minimum length is optional, so it is only accepted
+                    // attached (`--strings=8`): a separate word is always the
+                    // next argument, never silently consumed.
+                    let min_len = match inline_val {
+                        Some(v) => usize::try_from(parse_byte_count(v)?).unwrap_or(4).max(1),
+                        None => 4,
                     };
                     cfg.strings_min_len = Some(min_len);
                 }
                 "diff" => {
-                    cfg.diff_path = Some(next_val("diff")?);
+                    cfg.diff_path = Some(flag_value(args, &mut i, inline_val, &flag)?.into());
                 }
                 "svg" => {
-                    cfg.svg_out = Some(next_val("svg")?);
+                    cfg.svg_out = Some(flag_value(args, &mut i, inline_val, &flag)?.into());
                 }
                 "svg-title" => {
-                    cfg.svg_title = Some(next_val("svg-title")?);
+                    cfg.svg_title = Some(flag_text(args, &mut i, inline_val, &flag)?);
                 }
                 "theme" => {
-                    let v = next_val("theme")?;
+                    let v = flag_text(args, &mut i, inline_val, &flag)?;
                     match v.to_ascii_lowercase().as_str() {
                         "dark" => cfg.theme = Theme::dark(),
                         "light" => cfg.theme = Theme::light(),
@@ -499,7 +602,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     }
                 }
                 "color" | "colour" => {
-                    let v = next_val("color")?;
+                    let v = flag_text(args, &mut i, inline_val, &flag)?;
                     match v.to_ascii_lowercase().as_str() {
                         "auto" => cfg.color_mode = ColorMode::Auto,
                         "always" | "truecolor" | "yes" => cfg.color_mode = ColorMode::TrueColor,
@@ -511,15 +614,23 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                         }
                     }
                 }
-                other => {
-                    let suggestion = suggest_long_flag(other);
-                    let suffix = match suggestion {
-                        Some(s) => format!(" (did you mean '--{s}'?)"),
-                        None => String::from(" (run 'octet --help' for usage)"),
-                    };
-                    return Err(Error::InvalidArgument(format!(
-                        "unrecognized option '--{other}'{suffix}"
-                    )));
+                switch => {
+                    if !apply_long_switch(&mut cfg, switch) {
+                        let suffix = match suggest_long_flag(switch) {
+                            Some(s) => format!(" (did you mean '--{s}'?)"),
+                            None => String::from(" (run 'octet --help' for usage)"),
+                        };
+                        return Err(Error::InvalidArgument(format!(
+                            "unrecognized option '{flag}'{suffix}"
+                        )));
+                    }
+                    // `--json=no` reads as a request to turn JSON off; doing
+                    // the opposite of what was written is worse than failing.
+                    if let Some(v) = inline_val {
+                        return Err(Error::InvalidArgument(format!(
+                            "option '{flag}' does not take a value (got '{v}')"
+                        )));
+                    }
                 }
             }
         } else if arg.starts_with('-') && arg.len() > 1 {
@@ -528,19 +639,9 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
             let mut c_idx = 0;
             while c_idx < chars.len() {
                 let ch = chars[c_idx];
-                let inline_rest: String = chars[c_idx + 1..].iter().collect();
-                let mut take_short_val = |flag: char| -> Result<String> {
-                    if !inline_rest.is_empty() {
-                        Ok(inline_rest.clone())
-                    } else if i + 1 < args.len() {
-                        i += 1;
-                        Ok(args[i].clone())
-                    } else {
-                        Err(Error::InvalidArgument(format!(
-                            "option '-{flag}' requires an argument"
-                        )))
-                    }
-                };
+                let rest: String = chars[c_idx + 1..].iter().collect();
+                let inline = (!rest.is_empty()).then_some(rest.as_str());
+                let flag = format!("-{ch}");
 
                 match ch {
                     'h' => cfg.help = true,
@@ -565,39 +666,31 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     'j' => cfg.json = true,
                     'u' => cfg.upper_hex = true,
                     'c' => {
-                        let v = take_short_val('c')?;
-                        let c = usize::try_from(parse_byte_count(&v)?).unwrap_or(usize::MAX);
-                        if c > 256 {
-                            return Err(Error::InvalidArgument(format!(
-                                "column count {c} exceeds maximum supported columns (256)"
-                            )));
-                        }
-                        cfg.cols = Some(c);
+                        cfg.cols = Some(parse_cols(&flag_text(args, &mut i, inline, &flag)?)?);
                         break;
                     }
                     'g' => {
-                        let v = take_short_val('g')?;
+                        let v = flag_text(args, &mut i, inline, &flag)?;
                         cfg.group_size =
                             Some(usize::try_from(parse_byte_count(&v)?).unwrap_or(usize::MAX));
                         break;
                     }
                     'l' | 'n' => {
-                        let v = take_short_val(ch)?;
+                        let v = flag_text(args, &mut i, inline, &flag)?;
                         cfg.length = Some(parse_byte_count(&v)?);
                         break;
                     }
                     'o' => {
-                        let v = take_short_val('o')?;
+                        let v = flag_text(args, &mut i, inline, &flag)?;
                         cfg.display_offset = Some(parse_byte_count(&v)?);
                         break;
                     }
                     's' => {
-                        let v = take_short_val('s')?;
-                        cfg.seek = Some(v);
+                        cfg.seek = Some(flag_text(args, &mut i, inline, &flag)?);
                         break;
                     }
                     'S' => {
-                        let v = take_short_val('S')?;
+                        let v = flag_text(args, &mut i, inline, &flag)?;
                         cfg.search_patterns.push(v);
                         break;
                     }
@@ -610,7 +703,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                 c_idx += 1;
             }
         } else {
-            positional.push(arg.clone());
+            positional.push(args[i].clone());
         }
         i += 1;
     }
@@ -620,89 +713,88 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
             "expected at most 2 positional arguments: [infile [outfile]]".to_owned(),
         ));
     }
-    if let Some(first) = positional.first()
-        && first != "-"
-    {
-        cfg.input_path = Some(first.clone());
-    }
-    if let Some(second) = positional.get(1)
-        && second != "-"
-    {
-        cfg.output_path = Some(second.clone());
-    }
+    let mut positional = positional.into_iter().map(|p| (p != "-").then(|| p.into()));
+    cfg.input_path = positional.next().flatten();
+    cfg.output_path = positional.next().flatten();
 
     Ok(cfg)
 }
 
+/// Reads the `-s`/`-l` window of `path` (stdin when `None`) and returns it
+/// with the absolute offset it starts at.
 fn read_input_window(
-    path: Option<&str>,
+    path: Option<&Path>,
     seek_spec: Option<&str>,
     length: Option<u64>,
 ) -> Result<(Vec<u8>, u64)> {
-    if let Some(p) = path {
-        let mut file = File::open(p)?;
-        let file_len = file.metadata().ok().map(|m| m.len());
-        let start_off = if let Some(spec) = seek_spec {
-            let trimmed = spec.trim();
-            if let Some(neg) = trimmed.strip_prefix('-') {
-                let back = parse_byte_count(neg)?;
-                let len = file_len.unwrap_or(0);
-                let target = len.saturating_sub(back);
-                file.seek(SeekFrom::Start(target))?
-            } else {
-                let raw_pos = parse_byte_count(trimmed)?;
-                let pos = file_len.map_or(raw_pos, |len| raw_pos.min(len));
-                match file.seek(SeekFrom::Start(pos)) {
-                    Ok(actual) => actual,
-                    Err(_) => {
-                        io::copy(&mut io::Read::by_ref(&mut file).take(pos), &mut io::sink())?
-                    }
-                }
-            }
-        } else {
-            0
-        };
+    let Some(path) = path else {
+        return read_stream_window(io::stdin().lock(), seek_spec, length);
+    };
+    let mut file = File::open(path)?;
+    let meta = file.metadata()?;
+    let seek_spec = seek_spec.map(str::trim);
 
-        let mut buf = Vec::new();
-        if let Some(limit) = length {
-            file.take(limit).read_to_end(&mut buf)?;
-        } else {
-            file.read_to_end(&mut buf)?;
+    // Only a regular file has a length worth trusting; a pipe or FIFO
+    // (`/dev/stdin`, `<(…)`) reports what happens to be buffered, often 0.
+    if !meta.is_file() {
+        if let Some(spec) = seek_spec.filter(|s| !s.starts_with('-')) {
+            let pos = parse_byte_count(spec)?;
+            // Block devices can seek; when a pipe refuses, fall through and
+            // skip by reading, as xxd does.
+            if let Ok(at) = file.seek(SeekFrom::Start(pos)) {
+                return Ok((read_limited(file, length)?, at));
+            }
         }
-        Ok((buf, start_off))
-    } else {
-        let stdin = io::stdin();
-        let mut handle = stdin.lock();
-        if let Some(spec) = seek_spec {
-            let trimmed = spec.trim();
-            if trimmed.starts_with('-') {
-                let mut full = Vec::new();
-                handle.read_to_end(&mut full)?;
-                let (sliced, off) = octet::slice_buffer(&full, Some(trimmed), length)?;
-                return Ok((sliced.to_vec(), off));
-            }
-            let pos = parse_byte_count(trimmed)?;
-            let skipped = io::copy(&mut handle.by_ref().take(pos), &mut io::sink())?;
-            let mut buf = Vec::new();
-            if let Some(limit) = length {
-                handle.take(limit).read_to_end(&mut buf)?;
-            } else {
-                handle.read_to_end(&mut buf)?;
-            }
-            Ok((buf, skipped))
-        } else {
-            let mut buf = Vec::new();
-            if let Some(limit) = length {
-                handle.take(limit).read_to_end(&mut buf)?;
-            } else {
-                handle.read_to_end(&mut buf)?;
-            }
-            Ok((buf, 0))
-        }
+        return read_stream_window(file, seek_spec, length);
     }
+
+    let start = match seek_spec {
+        None => 0,
+        Some(spec) => {
+            let target = match spec.strip_prefix('-') {
+                Some(back) => meta.len().saturating_sub(parse_byte_count(back)?),
+                None => parse_byte_count(spec)?.min(meta.len()),
+            };
+            file.seek(SeekFrom::Start(target))?
+        }
+    };
+    Ok((read_limited(file, length)?, start))
 }
 
-fn write_output(path: Option<&str>, bytes: &[u8]) -> Result<()> {
+/// Reads the `-s`/`-l` window of a stream that cannot seek: a positive seek
+/// is skipped by reading, and a seek from the end needs the whole stream.
+fn read_stream_window(
+    mut reader: impl io::Read,
+    seek_spec: Option<&str>,
+    length: Option<u64>,
+) -> Result<(Vec<u8>, u64)> {
+    let skipped = match seek_spec.map(str::trim) {
+        None => 0,
+        Some(spec) if spec.starts_with('-') => {
+            let mut full = Vec::new();
+            reader.read_to_end(&mut full)?;
+            let (sliced, off) = octet::slice_buffer(&full, Some(spec), length)?;
+            return Ok((sliced.to_vec(), off));
+        }
+        Some(spec) => {
+            let pos = parse_byte_count(spec)?;
+            io::copy(&mut reader.by_ref().take(pos), &mut io::sink())?
+        }
+    };
+    Ok((read_limited(reader, length)?, skipped))
+}
+
+fn read_limited(reader: impl io::Read, length: Option<u64>) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader
+        .take(length.unwrap_or(u64::MAX))
+        .read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Writes to `path`, or to stdout when `None`. A closed stdout (`octet f |
+/// head`) ends output quietly, as in other Unix filters, rather than failing.
+fn write_output(path: Option<&Path>, bytes: &[u8]) -> Result<()> {
     if let Some(p) = path {
         fs::write(p, bytes)?;
     } else {
@@ -1020,6 +1112,14 @@ fn render_help(t: &Theme, c: bool) -> String {
         out,
         "{}",
         flag(
+            "--name <IDENT>",
+            "Identifier for the -i array (default: derived from INFILE)"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
             "-r, --reverse",
             "Reverse hex dump (octet, xxd, hexdump -C, or -r -p) to binary"
         )
@@ -1066,6 +1166,27 @@ fn render_help(t: &Theme, c: bool) -> String {
             "Render vector macOS terminal window screenshot to <PATH>"
         )
     );
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
+            "--svg-title <TITLE>",
+            "Window title for the --svg screenshot"
+        )
+    );
+
+    let _ = writeln!(out, "{}", section("◈ SHELL INTEGRATION & META"));
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
+            "--completions <bash|zsh|fish>",
+            "Print a shell completion script"
+        )
+    );
+    let _ = writeln!(out, "{}", flag("--man", "Print the troff manual page"));
+    let _ = writeln!(out, "{}", flag("-V, --version", "Print the version"));
+    let _ = writeln!(out, "{}", flag("-h, --help", "Print this help"));
 
     let _ = writeln!(out, "\n{top}");
     let ex_hdr = " ◈ QUICK EXAMPLES";
@@ -1161,7 +1282,7 @@ _octet() {
         '--diff[Side-by-side binary diff]:file:_files' \
         '(-S --search)'{-S,--search}'[Highlight pattern]:pattern:' \
         '--inspect[Inspect multi-type values at offset]:offset:' \
-        '--strings[Extract printable ASCII and UTF-8 strings]' \
+        '--strings=-[Extract printable ASCII and UTF-8 strings]::min_len:' \
         '(-i --include)'{-i,--include}'[Generate source array]' \
         '--lang[Target language for codegen]:lang:(rust c go python ts zig csharp)' \
         '--name[Variable identifier for codegen]:name:' \
@@ -1171,6 +1292,7 @@ _octet() {
         '--theme[Select color palette]:theme:(dark light)' \
         '--color[Control ANSI color]:mode:(auto always never)' \
         '--svg[Render vector terminal SVG]:path:_files' \
+        '--svg-title[Window title for the SVG]:title:' \
         '--completions[Generate shell completions]:shell:(bash zsh fish)' \
         '--man[Render troff manual page]' \
         '*:file:_files'
@@ -1203,12 +1325,14 @@ complete -c octet -l inspect -r -d "Inspect values at offset"
 complete -c octet -l strings -d "Extract printable ASCII and UTF-8 strings"
 complete -c octet -s i -l include -d "Generate source code array"
 complete -c octet -l lang -r -a "rust c go python ts zig csharp" -d "Codegen language"
+complete -c octet -l name -r -d "Variable identifier for codegen"
 complete -c octet -s r -l reverse -d "Reverse hex dump to binary"
 complete -c octet -s j -l json -d "Emit structured JSON report"
 complete -c octet -l no-annotate -d "Disable magic header annotations"
 complete -c octet -l theme -r -a "dark light" -d "Color palette"
 complete -c octet -l color -r -a "auto always never" -d "Color mode"
 complete -c octet -l svg -r -F -d "Render vector SVG screenshot"
+complete -c octet -l svg-title -r -d "Window title for the SVG"
 complete -c octet -l completions -r -a "bash zsh fish" -d "Generate shell completions"
 complete -c octet -l man -d "Render troff manual page"
 "#,
@@ -1286,11 +1410,17 @@ Extract printable ASCII and graphic UTF-8 string literals (default >= 4 characte
 \fB\-i\fR, \fB\-\-include\fR [\fB\-\-lang\fR \fIL\fR]
 Emit source array in rust, c (default), go, python, ts, zig, or csharp.
 .TP
+\fB\-\-name\fR \fIIDENT\fR
+Identifier for the generated array (default: derived from \fIINFILE\fR).
+.TP
 \fB\-r\fR, \fB\-\-reverse\fR
 Reverse hex dump (octet, xxd, hexdump \-C, or \-r \-p) back to binary.
 .TP
 \fB\-j\fR, \fB\-\-json\fR
 Emit structured RFC 8259 JSON report.
+.TP
+\fB\-\-no\-annotate\fR
+Disable automatic magic header structural annotations.
 .TP
 \fB\-\-theme\fR \fIdark|light\fR
 Select calibrated color palette (or set \fBOCTET_THEME\fR).
@@ -1301,11 +1431,20 @@ Control ANSI TrueColor output (respects \fBNO_COLOR\fR / \fBOCTET_COLOR\fR).
 \fB\-\-svg\fR \fIPATH\fR
 Render vector macOS terminal window screenshot to \fIPATH\fR.
 .TP
+\fB\-\-svg\-title\fR \fITITLE\fR
+Window title for the \fB\-\-svg\fR screenshot.
+.TP
 \fB\-\-completions\fR \fIbash|zsh|fish\fR
 Generate shell completion script.
 .TP
 \fB\-\-man\fR
 Emit this manual page in troff format.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print the version.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print usage help.
 "#,
         env!("CARGO_PKG_VERSION")
     )

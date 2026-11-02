@@ -56,7 +56,12 @@ impl ColorMode {
                 if std::env::var("TERM").is_ok_and(|t| t == "dumb") {
                     return false;
                 }
-                is_tty || std::env::var_os("FORCE_COLOR").is_some()
+                // FORCE_COLOR=0, =false, or empty is how users and CI turn
+                // forcing off, so only other values count as a request.
+                let forced = std::env::var_os("FORCE_COLOR").is_some_and(|v| {
+                    !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+                });
+                is_tty || forced
             }
         }
     }
