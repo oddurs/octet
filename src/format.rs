@@ -134,7 +134,7 @@ pub enum DisplayRow {
 pub fn analyze_buffer(data: &[u8], opts: &FormatOptions) -> AnalyzedBuffer {
     let classes = classify_slice(data);
     let stats = ByteStats::analyze(data, &classes);
-    let header = if opts.annotate_headers && opts.display_offset == 0 {
+    let header = if opts.annotate_headers {
         inspect_header(data)
     } else {
         None

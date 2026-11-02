@@ -468,3 +468,189 @@ fn zero_length_prints_nothing_in_compatible_styles() {
         assert_eq!(render(args), "", "{args:?}");
     }
 }
+
+#[test]
+fn strings_takes_a_following_number_as_the_minimum_length() {
+    let dir = scratch_dir("strings_separate_min_len");
+    let original: &[u8] = b"\x00\x00hello world\x00abcdef\x00";
+    fs::write(dir.join("fw.bin"), original).expect("write");
+    fs::write(dir.join("8"), b"\x00tiny\x00").expect("write");
+    let out = octet()
+        .current_dir(&dir)
+        .args(["--strings", "8", "fw.bin", "-j"])
+        .output()
+        .expect("run octet");
+    let json = stdout_of(&out);
+    assert!(json.contains("\"text\": \"hello world\""), "{json}");
+    assert!(!json.contains("\"text\": \"abcdef\""), "{json}");
+    assert_eq!(fs::read(dir.join("fw.bin")).expect("read"), original);
+
+    // A file named only with digits is still reachable as a path.
+    let out = octet()
+        .current_dir(&dir)
+        .args(["--strings", "./8", "-j"])
+        .output()
+        .expect("run octet");
+    assert!(stdout_of(&out).contains("\"text\": \"tiny\""));
+}
+
+#[test]
+fn outfile_that_is_the_infile_is_refused() {
+    let dir = scratch_dir("outfile_is_infile");
+    let path = dir.join("x.bin");
+    let dump = b"00000000: 6865 6c6c 6f                             hello\n";
+    fs::write(&path, dump).expect("write");
+    let other_spelling = dir.join(".").join("x.bin");
+    let cases: [(&[&str], &PathBuf); 3] = [
+        (&[], &path),
+        (&["-r"], &path),
+        (&["--classic"], &other_spelling),
+    ];
+    for (args, out_path) in cases {
+        let out = octet()
+            .args(args)
+            .arg(&path)
+            .arg(out_path)
+            .output()
+            .expect("run octet");
+        assert_fails_with(&out, "is the same file as INFILE");
+        assert_eq!(fs::read(&path).expect("read"), dump, "{args:?}");
+    }
+
+    #[cfg(unix)]
+    {
+        let link = dir.join("link.bin");
+        let _ = fs::remove_file(&link);
+        fs::hard_link(&path, &link).expect("hard link");
+        let out = octet().arg(&path).arg(&link).output().expect("run octet");
+        assert_fails_with(&out, "is the same file as INFILE");
+        assert_eq!(fs::read(&path).expect("read"), dump);
+    }
+}
+
+#[test]
+fn plain_and_include_modes_have_no_column_maximum() {
+    let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+    let input = scratch_file("plain_cols", "in.bin", &data);
+    let out = octet()
+        .args(["-p", "-c", "300"])
+        .arg(&input)
+        .output()
+        .expect("run octet");
+    let text = stdout_of(&out);
+    assert_eq!(text.lines().next().map(str::len), Some(600), "{text}");
+
+    let out = octet()
+        .args(["-i", "-c", "300"])
+        .arg(&input)
+        .output()
+        .expect("run octet");
+    assert!(
+        stdout_of(&out)
+            .lines()
+            .any(|l| l.matches("0x").count() == 300)
+    );
+
+    // xxd keeps the 256 cap for its row layouts.
+    let out = octet()
+        .args(["--classic", "-c", "300"])
+        .arg(&input)
+        .output()
+        .expect("run octet");
+    assert_fails_with(&out, "maximum supported columns (256)");
+}
+
+#[test]
+fn help_diff_example_puts_the_new_file_on_the_right() {
+    let help = stdout_of(
+        &octet()
+            .args(["--help", "--color", "never"])
+            .output()
+            .expect("run octet --help"),
+    );
+    assert!(help.contains("octet v1.bin --diff v2.bin"), "{help}");
+    assert!(!help.contains("--diff v1.bin v2.bin"), "{help}");
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_completion_keeps_a_file_name_with_spaces_in_one_word() {
+    let dir = scratch_dir("bash_completion_spaces");
+    fs::write(dir.join("my file.bin"), b"x").expect("write");
+    let script = stdout_of(
+        &octet()
+            .args(["--completions", "bash"])
+            .output()
+            .expect("run --completions"),
+    );
+    let out = Command::new("bash")
+        .current_dir(&dir)
+        .arg("-c")
+        .arg(
+            r#"eval "$1"
+COMP_WORDS=(octet "my f"); COMP_CWORD=1; _octet
+printf '%s\n' "${#COMPREPLY[@]}" "${COMPREPLY[@]}""#,
+        )
+        .arg("bash")
+        .arg(&script)
+        .output()
+        .expect("run bash");
+    assert_eq!(stdout_of(&out), "1\nmy file.bin\n");
+}
+
+#[test]
+fn display_offset_keeps_header_recognition_but_seek_drops_it() {
+    let mut zip = b"PK\x03\x04\x14\x00\x00\x00\x08\x00".to_vec();
+    zip.resize(256, 0);
+    let input = scratch_file("display_offset_header", "a.zip", &zip);
+    let header_of = |args: &[&str]| {
+        let out = octet().args(args).arg(&input).output().expect("run octet");
+        stdout_of(&out).contains("\"header\": {")
+    };
+    assert!(header_of(&["-j"]));
+    assert!(header_of(&["-j", "-o", "0x10"]));
+    assert!(!header_of(&["-j", "-s", "100"]));
+}
+
+#[test]
+fn man_page_date_is_a_parseable_generation_date() {
+    for (epoch, date) in [("0", "1970-01-01"), ("951782400", "2000-02-29")] {
+        let out = octet()
+            .arg("--man")
+            .env("SOURCE_DATE_EPOCH", epoch)
+            .output()
+            .expect("run --man");
+        let man = stdout_of(&out);
+        let first = man.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with(&format!(".TH OCTET 1 \"{date}\" ")),
+            "{first}"
+        );
+    }
+}
+
+/// macOS ships mandoc, so its linter checks the page there.
+#[cfg(target_os = "macos")]
+#[test]
+fn man_page_passes_mandoc_lint() {
+    let man = stdout_of(&octet().arg("--man").output().expect("run --man"));
+    let mut lint = Command::new("mandoc")
+        .args(["-T", "lint"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mandoc");
+    lint.stdin
+        .take()
+        .expect("stdin")
+        .write_all(man.as_bytes())
+        .expect("write man page");
+    let out = lint.wait_with_output().expect("wait mandoc");
+    assert!(
+        out.status.success() && out.stdout.is_empty() && out.stderr.is_empty(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
