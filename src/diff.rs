@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::classify::ByteClass;
 use crate::theme::Theme;
+use crate::width::pad_or_clip;
 
 /// Summary metrics for a binary comparison between two buffers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,7 +361,7 @@ impl<'a> DiffLayout<'a> {
             " ◈ BINARY DIFF  │  {} Δ bytes across {} changed rows  │  {similarity:.1}% identical",
             report.changed_bytes, report.changed_rows
         );
-        let padded = pad_diff_cell(&summary, inner_w);
+        let padded = pad_or_clip(&summary, inner_w);
         let _ = writeln!(
             out,
             "{}{}{}",
@@ -373,8 +374,8 @@ impl<'a> DiffLayout<'a> {
             "OFFSET",
             width = self.off_w.saturating_sub(2)
         );
-        let left_hdr = pad_diff_cell(&format!("⊖ {left_short} ({} B)", report.left_len), side_w);
-        let right_hdr = pad_diff_cell(
+        let left_hdr = pad_or_clip(&format!("⊖ {left_short} ({} B)", report.left_len), side_w);
+        let right_hdr = pad_or_clip(
             &format!("⊕ {right_short} ({} B)", report.right_len),
             side_w.saturating_sub(1),
         );
@@ -406,7 +407,7 @@ impl<'a> DiffLayout<'a> {
                 byte_count,
             } => {
                 let off_str = theme.format_offset(*start_offset, off_w, false, color);
-                let msg = pad_diff_cell(
+                let msg = pad_or_clip(
                     &format!(" ⋮ ⋯ {row_count} identical rows ({byte_count} bytes) unchanged ⋯"),
                     self.table_w.saturating_sub(off_w + 1),
                 );
@@ -447,7 +448,7 @@ impl<'a> DiffLayout<'a> {
         let _ = writeln!(out, "{}", theme.paint(&top_bar, theme.border, color));
         let footer_plain =
             " Δ Modified Row   ⊖ Left / Removed Byte   ⊕ Right / Added Byte   · Unchanged";
-        let footer_padded = pad_diff_cell(footer_plain, inner_w);
+        let footer_padded = pad_or_clip(footer_plain, inner_w);
         let _ = writeln!(
             out,
             "{}{}{}",
@@ -477,24 +478,6 @@ fn build_diff_junction_bar(
     }
     s.push(right);
     s
-}
-
-fn pad_diff_cell(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count > width {
-        if width >= 4 {
-            let mut clipped: String = s.chars().take(width - 2).collect();
-            clipped.push('…');
-            clipped.push(' ');
-            clipped
-        } else {
-            let mut clipped: String = s.chars().take(width.saturating_sub(1)).collect();
-            clipped.push('…');
-            clipped
-        }
-    } else {
-        format!("{s}{}", " ".repeat(width - count))
-    }
 }
 
 /// Renders a [`DiffReport`] as a standalone RFC 8259 JSON object.
@@ -605,4 +588,33 @@ fn format_diff_side(
         theme.paint("│", theme.border, color),
         theme.paint("│", theme.border, color)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::width::str_width;
+
+    /// Cells pad by terminal columns, so a CJK file name, two columns per
+    /// ideograph, leaves the card's right border straight.
+    #[test]
+    fn a_wide_file_name_keeps_every_card_line_the_same_width() {
+        let left = b"hello, world".to_vec();
+        let mut right = left.clone();
+        right[3] = b'L';
+        let report = compute_diff(&left, &right, 8, 0, true);
+        let card = render_diff_ansi(
+            &report,
+            "数据/旧版本.bin",
+            "新版本.bin",
+            8,
+            &Theme::dark(),
+            false,
+        );
+        let widths: Vec<usize> = card.lines().map(str_width).collect();
+        assert!(
+            widths.iter().all(|&w| w == widths[0]),
+            "line widths {widths:?} in:\n{card}"
+        );
+    }
 }
