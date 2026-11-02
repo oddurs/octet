@@ -86,6 +86,7 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
         };
 
         let rest = &trimmed[offset_end..];
+        let colon_row = rest.starts_with(':');
         let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
 
         // If this is an `octet` elision bridge (`⋮   ⋯ N identical rows ...`), immediately
@@ -105,18 +106,24 @@ fn reverse_structured(input: &str) -> Result<Vec<u8>> {
             continue;
         }
 
-        // Isolate the data column before the glyph pane (`│` in octet, `|` in hexdump -C, or two spaces in xxd).
-        let data_zone = if let Some((before_pipe, _)) = rest.split_once('│') {
-            before_pipe
-        } else if let Some((before_ascii_pipe, _)) = rest.split_once("  |") {
-            before_ascii_pipe
-        } else if let Some((before_gap, _)) = rest.split_once("  ") {
-            before_gap
+        // The ASCII column may itself contain `|` or runs of spaces, so the separator is chosen
+        // from the row's shape rather than from whichever marker appears first.
+        let (data_zone, glyphs) = if let Some((data, pane)) = rest.split_once('│') {
+            let pane = pane.split('│').next().unwrap_or(pane);
+            (data, Glyphs::Octet(pane))
+        } else if colon_row {
+            let data = rest.split_once("  ").map_or(rest, |(data, _)| data);
+            (data, Glyphs::Xxd(rest))
+        } else if rest.trim_end().ends_with('|')
+            && let Some((data, _)) = rest.split_once("  |")
+        {
+            (data, Glyphs::Unknown)
         } else {
-            rest
+            let data = rest.split_once("  ").map_or(rest, |(data, _)| data);
+            (data, Glyphs::Unknown)
         };
 
-        let row_bytes = parse_data_tokens(data_zone);
+        let row_bytes = parse_data_tokens(data_zone, &glyphs);
         if row_bytes.is_empty() {
             // In `hexdump -C`, a trailing `*` elision is followed by an offset-only EOF line.
             if pending_star
@@ -184,7 +191,16 @@ fn parse_elided_row_count(rest: &str) -> Option<usize> {
     None
 }
 
-fn parse_data_tokens(data_zone: &str) -> Vec<u8> {
+/// The glyph column of a row, which says how many bytes the row holds.
+enum Glyphs<'a> {
+    /// The pane between `│` rails: one glyph per byte, padded with spaces after the last.
+    Octet(&'a str),
+    /// The row after the `xxd` address colon; it ends with the printable-or-`.` ASCII column.
+    Xxd(&'a str),
+    Unknown,
+}
+
+fn parse_data_tokens(data_zone: &str, glyphs: &Glyphs<'_>) -> Vec<u8> {
     let tokens: Vec<&str> = data_zone
         .split_whitespace()
         .filter(|&t| t != "⋮" && t != "│")
@@ -193,19 +209,55 @@ fn parse_data_tokens(data_zone: &str) -> Vec<u8> {
         return Vec::new();
     }
 
-    // Check if all tokens are 8-bit binary strings (`00` / `01` etc. of length 8).
-    let is_binary_row = tokens
+    let all_bit_tokens = tokens
         .iter()
         .all(|t| t.len() == 8 && t.chars().all(|c| c == '0' || c == '1'));
-    if is_binary_row {
-        return tokens
+    if all_bit_tokens {
+        let bits: Vec<u8> = tokens
             .iter()
             .filter_map(|t| u8::from_str_radix(t, 2).ok())
             .collect();
+        if !glyphs_contradict_bits(&bits, &tokens, glyphs) {
+            return bits;
+        }
     }
 
+    parse_hex_tokens(&tokens)
+}
+
+/// Decides whether 8-character `0`/`1` tokens are `-g4` hex groups rather than `-b` bits.
+///
+/// A bit row holds one byte per token and a hex row four, so the glyph column tells them apart.
+/// Without a usable glyph column the row is read as bits, which is what `-b` produces.
+fn glyphs_contradict_bits(bits: &[u8], tokens: &[&str], glyphs: &Glyphs<'_>) -> bool {
+    match glyphs {
+        Glyphs::Octet(pane) => pane.trim_end().chars().count() != bits.len(),
+        Glyphs::Xxd(row) => {
+            // Requiring a space before the column stops a short bit rendering from matching
+            // the tail of a longer hex rendering made only of `.`.
+            let ends_with_column = |bytes: &[u8]| {
+                let column: String = bytes
+                    .iter()
+                    .map(|&b| {
+                        if (0x20..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                row.strip_suffix(column.as_str())
+                    .is_some_and(|head| head.ends_with(' '))
+            };
+            !ends_with_column(bits) && ends_with_column(&parse_hex_tokens(tokens))
+        }
+        Glyphs::Unknown => false,
+    }
+}
+
+fn parse_hex_tokens(tokens: &[&str]) -> Vec<u8> {
     let mut bytes = Vec::new();
-    for raw_token in tokens {
+    for &raw_token in tokens {
         let token = raw_token
             .strip_prefix("0x")
             .or_else(|| raw_token.strip_prefix("0X"))
