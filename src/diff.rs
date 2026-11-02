@@ -268,12 +268,59 @@ pub fn render_diff_ansi(
 fn pad_diff_cell(s: &str, width: usize) -> String {
     let count = s.chars().count();
     if count > width {
-        let mut clipped: String = s.chars().take(width.saturating_sub(1)).collect();
-        clipped.push('…');
-        clipped
+        if width >= 4 {
+            let mut clipped: String = s.chars().take(width - 2).collect();
+            clipped.push('…');
+            clipped.push(' ');
+            clipped
+        } else {
+            let mut clipped: String = s.chars().take(width.saturating_sub(1)).collect();
+            clipped.push('…');
+            clipped
+        }
     } else {
         format!("{s}{}", " ".repeat(width - count))
     }
+}
+
+/// Renders a [`DiffReport`] as a standalone RFC 8259 JSON object.
+#[must_use]
+pub fn render_diff_json(report: &DiffReport, left_label: &str, right_label: &str) -> String {
+    let max_len = report.left_len.max(report.right_len);
+    let similarity = if max_len == 0 {
+        100.0
+    } else {
+        ((max_len.saturating_sub(report.changed_bytes) as f64) / (max_len as f64)) * 100.0
+    };
+    let mut out = String::from("{\n");
+    let _ = writeln!(out, "  \"mode\": \"diff\",");
+    let _ = writeln!(out, "  \"left_label\": \"{}\",", escape_json(left_label));
+    let _ = writeln!(out, "  \"right_label\": \"{}\",", escape_json(right_label));
+    let _ = writeln!(out, "  \"left_bytes\": {},", report.left_len);
+    let _ = writeln!(out, "  \"right_bytes\": {},", report.right_len);
+    let _ = writeln!(out, "  \"changed_bytes\": {},", report.changed_bytes);
+    let _ = writeln!(out, "  \"changed_rows\": {},", report.changed_rows);
+    let _ = writeln!(out, "  \"similarity_pct\": {similarity:.2}");
+    out.push_str("}\n");
+    out
+}
+
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn basename(path: &str) -> &str {

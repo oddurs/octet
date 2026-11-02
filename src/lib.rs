@@ -29,10 +29,11 @@ pub mod theme;
 
 pub use crate::classify::{ByteClass, ByteStats, classify_slice, compute_entropy};
 pub use crate::codegen::{CodeLanguage, generate_code};
-pub use crate::diff::{DiffReport, DiffRow, compute_diff, render_diff_ansi};
+pub use crate::diff::{DiffReport, DiffRow, compute_diff, render_diff_ansi, render_diff_json};
 pub use crate::error::{Error, Result};
 pub use crate::format::{
     AnalyzedBuffer, DisplayRow, FormatOptions, Radix, ViewStyle, analyze_buffer, render_dump,
+    render_json_report,
 };
 pub use crate::inspect::{ValueInspection, find_pattern_spans, parse_search_pattern};
 pub use crate::magic::{FieldAnnotation, HeaderInspection, inspect_header};

@@ -12,7 +12,8 @@ use std::process::ExitCode;
 use octet::{
     CodeLanguage, ColorMode, Error, FormatOptions, Radix, Result, Theme, ValueInspection,
     ViewStyle, compute_diff, find_pattern_spans, generate_code, parse_byte_count,
-    parse_search_pattern, render_ansi_to_svg, render_diff_ansi, render_dump, reverse_dump,
+    parse_search_pattern, render_ansi_to_svg, render_diff_ansi, render_diff_json, render_dump,
+    render_json_report, reverse_dump,
 };
 
 fn main() -> ExitCode {
@@ -42,6 +43,7 @@ struct CliConfig {
     help: bool,
     version: bool,
     reverse: bool,
+    json: bool,
     include_codegen: bool,
     codegen_lang: CodeLanguage,
     codegen_name: Option<String>,
@@ -90,6 +92,7 @@ impl Default for CliConfig {
             help: false,
             version: false,
             reverse: false,
+            json: false,
             include_codegen: false,
             codegen_lang: CodeLanguage::C,
             codegen_name: None,
@@ -180,6 +183,11 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         let autoskip = cfg.autoskip.unwrap_or(true);
         let report = compute_diff(sliced, &right_sliced, cols, base_disp_offset, autoskip);
         let left_label = cfg.input_path.as_deref().unwrap_or("stdin");
+        if cfg.json {
+            let json_out = render_diff_json(&report, left_label, right_path);
+            write_output(cfg.output_path.as_deref(), json_out.as_bytes())?;
+            return Ok(());
+        }
         let rendered = render_diff_ansi(&report, left_label, right_path, cols, &cfg.theme, color);
         if let Some(ref svg_path) = cfg.svg_out {
             let default_title = format!("octet --diff {left_label} {right_path}");
@@ -249,19 +257,31 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         color,
     };
 
-    let mut rendered = render_dump(sliced, &opts);
-
-    if let Some(ref insp_str) = cfg.inspect_offset {
+    let inspection = if let Some(ref insp_str) = cfg.inspect_offset {
         let target_off = parse_byte_count(insp_str)?;
-        let rel_idx = target_off.saturating_sub(base_disp_offset) as usize;
+        let rel_idx =
+            usize::try_from(target_off.saturating_sub(base_disp_offset)).unwrap_or(usize::MAX);
         if let Some(insp) = ValueInspection::at(sliced, rel_idx, base_disp_offset) {
-            rendered.push_str(&insp.render_ansi(&cfg.theme, color));
+            Some(insp)
         } else {
             return Err(Error::InvalidOffset(format!(
                 "inspect offset 0x{target_off:x} is outside buffer range (0..0x{:x})",
                 sliced.len()
             )));
         }
+    } else {
+        None
+    };
+
+    if cfg.json {
+        let json_out = render_json_report(sliced, &opts, inspection.as_ref());
+        write_output(cfg.output_path.as_deref(), json_out.as_bytes())?;
+        return Ok(());
+    }
+
+    let mut rendered = render_dump(sliced, &opts);
+    if let Some(ref insp) = inspection {
+        rendered.push_str(&insp.render_ansi(&cfg.theme, color));
     }
 
     if let Some(ref svg_path) = cfg.svg_out {
@@ -362,6 +382,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     }
                 }
                 "reverse" => cfg.reverse = true,
+                "json" => cfg.json = true,
                 "upper" | "uppercase" => cfg.upper_hex = true,
                 "no-annotate" => cfg.annotate_headers = false,
                 "search" => {
@@ -455,6 +476,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     'q' => cfg.style = ViewStyle::Compact,
                     'C' => cfg.style = ViewStyle::Canonical,
                     'r' => cfg.reverse = true,
+                    'j' => cfg.json = true,
                     'u' => cfg.upper_hex = true,
                     'c' => {
                         let v = take_short_val('c')?;
@@ -654,6 +676,7 @@ fn suggest_long_flag(unknown: &str) -> Option<&'static str> {
         "classic",
         "xxd",
         "reverse",
+        "json",
         "upper",
         "no-annotate",
         "search",
@@ -901,6 +924,14 @@ fn render_help(t: &Theme, c: bool) -> String {
         flag(
             "-r, --reverse",
             "Reverse hex dump (octet, xxd, hexdump -C, or -r -p) to binary"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
+            "-j, --json",
+            "Emit structured RFC 8259 JSON report (telemetry, headers, diff, inspect)"
         )
     );
     let _ = writeln!(

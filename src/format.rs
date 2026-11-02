@@ -627,9 +627,16 @@ fn format_class_percentages(stats: &ByteStats) -> String {
 fn pad_or_clip(s: &str, width: usize) -> String {
     let count = s.chars().count();
     if count > width {
-        let mut clipped: String = s.chars().take(width.saturating_sub(1)).collect();
-        clipped.push('…');
-        clipped
+        if width >= 4 {
+            let mut clipped: String = s.chars().take(width - 2).collect();
+            clipped.push('…');
+            clipped.push(' ');
+            clipped
+        } else {
+            let mut clipped: String = s.chars().take(width.saturating_sub(1)).collect();
+            clipped.push('…');
+            clipped
+        }
     } else {
         format!("{s}{}", " ".repeat(width - count))
     }
@@ -1103,4 +1110,143 @@ fn render_legend_row(out: &mut String, opts: &FormatOptions, inner_w: usize) {
         t.paint("│", t.border, c),
         t.paint("│", t.border, c)
     );
+}
+
+/// Renders a structured RFC 8259 JSON analysis report for `data`.
+#[must_use]
+pub fn render_json_report(
+    data: &[u8],
+    opts: &FormatOptions,
+    inspection: Option<&crate::inspect::ValueInspection>,
+) -> String {
+    let analyzed = analyze_buffer(data, opts);
+    let st = &analyzed.stats;
+    let label = opts.label.as_deref().unwrap_or("stdin");
+
+    let mut out = String::from("{\n");
+    let _ = writeln!(out, "  \"label\": \"{}\",", escape_json(label));
+    let _ = writeln!(out, "  \"total_bytes\": {},", st.total_bytes);
+    let _ = writeln!(out, "  \"display_offset\": {},", opts.display_offset);
+    let _ = writeln!(out, "  \"entropy_bits_per_byte\": {:.4},", st.entropy);
+    let _ = writeln!(
+        out,
+        "  \"entropy_profile\": \"{}\",",
+        escape_json(st.entropy_profile())
+    );
+    let _ = writeln!(
+        out,
+        "  \"classes\": {{ \"null\": {}, \"ascii\": {}, \"control\": {}, \"utf8\": {}, \"high\": {}, \"sentinel\": {} }},",
+        st.null_count,
+        st.ascii_count,
+        st.control_count,
+        st.utf8_count,
+        st.high_count,
+        st.sentinel_count
+    );
+
+    if let Some(ref hdr) = analyzed.header {
+        let _ = writeln!(out, "  \"header\": {{");
+        let _ = writeln!(
+            out,
+            "    \"format_name\": \"{}\",",
+            escape_json(hdr.format_name)
+        );
+        let _ = writeln!(
+            out,
+            "    \"mime_type\": \"{}\",",
+            escape_json(hdr.mime_or_category)
+        );
+        let _ = writeln!(out, "    \"summary\": \"{}\",", escape_json(&hdr.summary));
+        let _ = writeln!(out, "    \"fields\": [");
+        for (i, f) in hdr.fields.iter().enumerate() {
+            let comma = if i + 1 < hdr.fields.len() { "," } else { "" };
+            let _ = writeln!(
+                out,
+                "      {{ \"name\": \"{}\", \"start\": {}, \"end\": {}, \"value\": \"{}\" }}{comma}",
+                escape_json(f.name),
+                f.range.start,
+                f.range.end,
+                escape_json(&f.value)
+            );
+        }
+        let _ = writeln!(out, "    ]");
+        let _ = writeln!(out, "  }},");
+    } else {
+        let _ = writeln!(out, "  \"header\": null,");
+    }
+
+    let match_offsets: Vec<String> = opts
+        .search_spans
+        .iter()
+        .map(|r| (opts.display_offset.saturating_add(r.start as u64)).to_string())
+        .collect();
+    let _ = writeln!(out, "  \"search_matches\": [{}],", match_offsets.join(", "));
+
+    if let Some(insp) = inspection {
+        let _ = writeln!(out, "  \"inspection\": {{");
+        let _ = writeln!(out, "    \"offset\": {},", insp.offset);
+        if let Some((u, i)) = insp.int8 {
+            let _ = writeln!(out, "    \"u8\": {u}, \"i8\": {i},");
+        }
+        if let Some(((ule, ile), (ube, ibe))) = insp.int16 {
+            let _ = writeln!(
+                out,
+                "    \"u16_le\": {ule}, \"i16_le\": {ile}, \"u16_be\": {ube}, \"i16_be\": {ibe},"
+            );
+        }
+        if let Some(((ule, ile), (ube, ibe))) = insp.int32 {
+            let _ = writeln!(
+                out,
+                "    \"u32_le\": {ule}, \"i32_le\": {ile}, \"u32_be\": {ube}, \"i32_be\": {ibe},"
+            );
+        }
+        if let Some(((ule, ile), (ube, ibe))) = insp.int64 {
+            let _ = writeln!(
+                out,
+                "    \"u64_le\": {ule}, \"i64_le\": {ile}, \"u64_be\": {ube}, \"i64_be\": {ibe},"
+            );
+        }
+        if let Some((val, len)) = insp.uleb128 {
+            let _ = writeln!(
+                out,
+                "    \"uleb128\": {{ \"value\": {val}, \"bytes\": {len} }},"
+            );
+        } else {
+            let _ = writeln!(out, "    \"uleb128\": null,");
+        }
+        if let Some((ch, len)) = insp.utf8_char {
+            let _ = writeln!(
+                out,
+                "    \"utf8_char\": {{ \"char\": \"{}\", \"codepoint\": {}, \"bytes\": {len} }}",
+                escape_json(&ch.to_string()),
+                ch as u32
+            );
+        } else {
+            let _ = writeln!(out, "    \"utf8_char\": null");
+        }
+        let _ = writeln!(out, "  }}");
+    } else {
+        let _ = writeln!(out, "  \"inspection\": null");
+    }
+
+    out.push_str("}\n");
+    out
+}
+
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }

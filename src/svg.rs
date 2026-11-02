@@ -196,9 +196,16 @@ const fn is_vector_glyph(ch: char) -> bool {
             | '╯'
             | '├'
             | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
             | '┌'
             | '└'
             | '⋮'
+            | '⋯'
+            | '◈'
+            | '◂'
+            | '▸'
             | '▁'
             | '▂'
             | '▃'
@@ -386,6 +393,37 @@ fn try_render_vector_glyph(
             );
             true
         }
+        '┬' => {
+            let _ = writeln!(
+                svg,
+                r#"  <path d="M {:.2} {cy:.2} L {:.2} {cy:.2} M {cx:.2} {cy:.2} L {cx:.2} {:.2}" fill="none" stroke="{hex}" stroke-width="1.3"/>"#,
+                x - 0.3,
+                x_end + 0.3,
+                y_end + 0.3
+            );
+            true
+        }
+        '┴' => {
+            let _ = writeln!(
+                svg,
+                r#"  <path d="M {:.2} {cy:.2} L {:.2} {cy:.2} M {cx:.2} {:.2} L {cx:.2} {cy:.2}" fill="none" stroke="{hex}" stroke-width="1.3"/>"#,
+                x - 0.3,
+                x_end + 0.3,
+                y - 0.3
+            );
+            true
+        }
+        '┼' => {
+            let _ = writeln!(
+                svg,
+                r#"  <path d="M {:.2} {cy:.2} L {:.2} {cy:.2} M {cx:.2} {:.2} L {cx:.2} {:.2}" fill="none" stroke="{hex}" stroke-width="1.3"/>"#,
+                x - 0.3,
+                x_end + 0.3,
+                y - 0.3,
+                y_end + 0.3
+            );
+            true
+        }
         '⋮' => {
             for dy in [-4.5, 0.0, 4.5] {
                 let _ = writeln!(
@@ -394,6 +432,56 @@ fn try_render_vector_glyph(
                     cy + dy
                 );
             }
+            true
+        }
+        '⋯' => {
+            for dx in [-2.6, 0.0, 2.6] {
+                let _ = writeln!(
+                    svg,
+                    r#"  <circle cx="{:.2}" cy="{cy:.2}" r="0.95" fill="{hex}"/>"#,
+                    cx + dx
+                );
+            }
+            true
+        }
+        '◈' => {
+            let r = 3.6;
+            let _ = writeln!(
+                svg,
+                r#"  <polygon points="{cx:.2},{:.2} {:.2},{cy:.2} {cx:.2},{:.2} {:.2},{cy:.2}" fill="none" stroke="{hex}" stroke-width="1.2"/>"#,
+                cy - r,
+                cx + r,
+                cy + r,
+                cx - r
+            );
+            let _ = writeln!(
+                svg,
+                r#"  <circle cx="{cx:.2}" cy="{cy:.2}" r="1.2" fill="{hex}"/>"#
+            );
+            true
+        }
+        '◂' => {
+            let _ = writeln!(
+                svg,
+                r#"  <polygon points="{:.2},{cy:.2} {:.2},{:.2} {:.2},{:.2}" fill="{hex}"/>"#,
+                cx - 2.6,
+                cx + 2.2,
+                cy - 3.2,
+                cx + 2.2,
+                cy + 3.2
+            );
+            true
+        }
+        '▸' => {
+            let _ = writeln!(
+                svg,
+                r#"  <polygon points="{:.2},{cy:.2} {:.2},{:.2} {:.2},{:.2}" fill="{hex}"/>"#,
+                cx + 2.6,
+                cx - 2.2,
+                cy - 3.2,
+                cx - 2.2,
+                cy + 3.2
+            );
             true
         }
         '·' => {

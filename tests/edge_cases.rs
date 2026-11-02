@@ -8,8 +8,8 @@ use std::process::{Command, Stdio};
 
 use octet::{
     FormatOptions, Theme, ValueInspection, ViewStyle, compute_diff, inspect_header,
-    parse_byte_count, render_ansi_to_svg, render_diff_ansi, render_dump, reverse_dump,
-    slice_buffer, strip_ansi,
+    parse_byte_count, render_ansi_to_svg, render_diff_ansi, render_diff_json, render_dump,
+    render_json_report, reverse_dump, slice_buffer, strip_ansi,
 };
 
 #[test]
@@ -224,4 +224,64 @@ fn test_byte_count_units_and_cli_edge_cases() {
     assert!(!typo.status.success());
     let typo_err = String::from_utf8_lossy(&typo.stderr);
     assert!(typo_err.contains("did you mean '--cols'?"));
+}
+
+#[test]
+fn test_extended_magic_headers_and_json_report() {
+    // 1. ISO BMFF (MP4 / HEIC / AVIF)
+    let mp4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x01";
+    let mp4_hdr = inspect_header(mp4).expect("MP4 header");
+    assert_eq!(mp4_hdr.format_name, "MP4 / ISO Base Media");
+
+    let heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00";
+    let heic_hdr = inspect_header(heic).expect("HEIC header");
+    assert_eq!(heic_hdr.format_name, "HEIC / HEIF Image");
+
+    // 2. 7-Zip Archive
+    let seven_z = b"7z\xbc\xaf\x27\x1c\x00\x04\x12\x34\x56\x78";
+    let sz_hdr = inspect_header(seven_z).expect("7z header");
+    assert_eq!(sz_hdr.format_name, "7-Zip Archive");
+
+    // 3. PCAP & PCAPNG
+    let pcap = [
+        0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x04,
+        0x00, 0x01, 0x00, 0x00, 0x00,
+    ];
+    let pcap_hdr = inspect_header(&pcap).expect("PCAP header");
+    assert_eq!(pcap_hdr.format_name, "PCAP Packet Capture");
+    assert!(pcap_hdr.summary.contains("v2.4"));
+
+    let pcapng = [
+        0x0a, 0x0d, 0x0d, 0x0a, 0x1c, 0x00, 0x00, 0x00, 0x4d, 0x3c, 0x2b, 0x1a,
+    ];
+    let pcapng_hdr = inspect_header(&pcapng).expect("PCAPNG header");
+    assert_eq!(pcapng_hdr.format_name, "PCAPNG Next-Gen Capture");
+
+    // 4. WOFF2 Font, Android DEX, and LLVM Bitcode
+    let woff2 = b"wOF2\x00\x01\x00\x00\x00\x00\x10\x00";
+    assert_eq!(inspect_header(woff2).unwrap().format_name, "WOFF2 Web Font");
+
+    let dex = b"dex\n039\0\x12\x34\x56\x78";
+    assert_eq!(
+        inspect_header(dex).unwrap().format_name,
+        "Android DEX Bytecode"
+    );
+
+    let llvm = b"BC\xc0\xde\x21\x0c\x00\x00";
+    assert_eq!(inspect_header(llvm).unwrap().format_name, "LLVM IR Bitcode");
+
+    // 5. JSON report generation (library & CLI `-j`)
+    let opts = FormatOptions {
+        label: Some("capture.pcap".to_owned()),
+        ..FormatOptions::default()
+    };
+    let insp = ValueInspection::at(&pcap, 0, 0);
+    let json = render_json_report(&pcap, &opts, insp.as_ref());
+    assert!(json.contains("\"format_name\": \"PCAP Packet Capture\""));
+    assert!(json.contains("\"u32_le\": 2712847316"));
+
+    let diff_rep = compute_diff(&pcap, &pcapng, 8, 0, true);
+    let diff_json = render_diff_json(&diff_rep, "a.pcap", "b.pcapng");
+    assert!(diff_json.contains("\"mode\": \"diff\""));
+    assert!(diff_json.contains("\"changed_bytes\":"));
 }

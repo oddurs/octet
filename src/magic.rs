@@ -103,6 +103,27 @@ pub fn inspect_header(data: &[u8]) -> Option<HeaderInspection> {
     if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
         return Some(parse_gif(data));
     }
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        return Some(parse_iso_bmff(data));
+    }
+    if data.starts_with(&[b'7', b'z', 0xbc, 0xaf, 0x27, 0x1c]) {
+        return Some(parse_7z(data));
+    }
+    if let Some(pcap) = try_parse_pcap(data) {
+        return Some(pcap);
+    }
+    if data.starts_with(&[0x0a, 0x0d, 0x0d, 0x0a]) {
+        return Some(parse_pcapng(data));
+    }
+    if data.starts_with(b"wOFF") || data.starts_with(b"wOF2") || data.starts_with(b"OTTO") {
+        return Some(parse_font(data));
+    }
+    if data.starts_with(b"dex\n") && data.len() >= 8 {
+        return Some(parse_dex(data));
+    }
+    if data.starts_with(&[b'B', b'C', 0xc0, 0xde]) {
+        return Some(parse_llvm_bc(data));
+    }
     if data.starts_with(b"#!") {
         return Some(parse_shebang(data));
     }
@@ -1160,6 +1181,267 @@ fn parse_shebang(data: &[u8]) -> HeaderInspection {
             range: 0..end,
             name: "Script.shebang",
             value: format!("\"{line}\""),
+            accent_index: 0,
+        }],
+    }
+}
+
+fn parse_iso_bmff(data: &[u8]) -> HeaderInspection {
+    let box_size = read_u32_be(data, 0).unwrap_or(0);
+    let major_brand = sanitize_header_str(&data[8..12]);
+    let (format_name, mime) = match major_brand.as_str() {
+        "heic" | "heix" | "mif1" => ("HEIC / HEIF Image", "image/heic"),
+        "avif" | "avis" => ("AVIF Image", "image/avif"),
+        "qt  " => ("QuickTime Movie (MOV)", "video/quicktime"),
+        "M4A " | "M4B " => ("MPEG-4 Audio (M4A)", "audio/mp4"),
+        _ => ("MP4 / ISO Base Media", "video/mp4"),
+    };
+    let mut fields = vec![
+        FieldAnnotation {
+            range: 0..4,
+            name: "ftyp.size",
+            value: format!("{box_size} bytes"),
+            accent_index: 0,
+        },
+        FieldAnnotation {
+            range: 4..8,
+            name: "ftyp.type",
+            value: "\"ftyp\" (File Type Box)".to_owned(),
+            accent_index: 1,
+        },
+        FieldAnnotation {
+            range: 8..12,
+            name: "ftyp.major_brand",
+            value: format!("\"{major_brand}\""),
+            accent_index: 2,
+        },
+    ];
+    if let Some(minor) = read_u32_be(data, 12) {
+        fields.push(FieldAnnotation {
+            range: 12..16,
+            name: "ftyp.minor_ver",
+            value: format!("v{minor}"),
+            accent_index: 3,
+        });
+    }
+    HeaderInspection {
+        format_name,
+        mime_or_category: mime,
+        summary: format!("{format_name} (brand=\"{major_brand}\", ftyp={box_size} B)"),
+        fields,
+    }
+}
+
+fn parse_7z(data: &[u8]) -> HeaderInspection {
+    let mut fields = vec![FieldAnnotation {
+        range: 0..6,
+        name: "7z.magic",
+        value: "7z\\xbc\\xaf\\x27\\x1c (7-Zip Signature)".to_owned(),
+        accent_index: 0,
+    }];
+    let mut summary = String::from("7-Zip Compressed Archive");
+    if data.len() >= 8 {
+        let maj = data[6];
+        let min = data[7];
+        summary = format!("7-Zip Archive v{maj}.{min}");
+        fields.push(FieldAnnotation {
+            range: 6..8,
+            name: "7z.version",
+            value: format!("v{maj}.{min}"),
+            accent_index: 1,
+        });
+    }
+    if let Some(crc) = read_u32_le(data, 8) {
+        fields.push(FieldAnnotation {
+            range: 8..12,
+            name: "7z.start_crc",
+            value: format!("0x{crc:08x}"),
+            accent_index: 2,
+        });
+    }
+    HeaderInspection {
+        format_name: "7-Zip Archive",
+        mime_or_category: "application/x-7z-compressed",
+        summary,
+        fields,
+    }
+}
+
+fn try_parse_pcap(data: &[u8]) -> Option<HeaderInspection> {
+    let magic_le = read_u32_le(data, 0)?;
+    let (is_le, is_nano) = match magic_le {
+        0xa1b2_c3d4 => (true, false),
+        0xd4c3_b2a1 => (false, false),
+        0xa1b2_3c4d => (true, true),
+        0x4d3c_b2a1 => (false, true),
+        _ => return None,
+    };
+    let read16 = |off| {
+        if is_le {
+            read_u16_le(data, off)
+        } else {
+            read_u16_be(data, off)
+        }
+    };
+    let read32 = |off| {
+        if is_le {
+            read_u32_le(data, off)
+        } else {
+            read_u32_be(data, off)
+        }
+    };
+    let ts_unit = if is_nano { "nanosecond" } else { "microsecond" };
+    let mut fields = vec![FieldAnnotation {
+        range: 0..4,
+        name: "PCAP.magic",
+        value: format!("0x{magic_le:08x} ({ts_unit} resolution)"),
+        accent_index: 0,
+    }];
+    let mut summary = format!("Libpcap Packet Capture ({ts_unit})");
+    if let (Some(maj), Some(min)) = (read16(4), read16(6)) {
+        fields.push(FieldAnnotation {
+            range: 4..8,
+            name: "PCAP.version",
+            value: format!("v{maj}.{min}"),
+            accent_index: 1,
+        });
+        summary = format!("Libpcap Capture v{maj}.{min} ({ts_unit})");
+    }
+    if let Some(snaplen) = read32(16) {
+        fields.push(FieldAnnotation {
+            range: 16..20,
+            name: "PCAP.snaplen",
+            value: format!("{snaplen} bytes"),
+            accent_index: 2,
+        });
+    }
+    if let Some(network) = read32(20) {
+        let link = match network {
+            1 => "LINKTYPE_ETHERNET",
+            101 => "LINKTYPE_RAW (Raw IP)",
+            113 => "LINKTYPE_LINUX_SLL",
+            228 => "LINKTYPE_IPV4",
+            _ => "Link Layer",
+        };
+        fields.push(FieldAnnotation {
+            range: 20..24,
+            name: "PCAP.network",
+            value: format!("{link} ({network})"),
+            accent_index: 3,
+        });
+    }
+    Some(HeaderInspection {
+        format_name: "PCAP Packet Capture",
+        mime_or_category: "application/vnd.tcpdump.pcap",
+        summary,
+        fields,
+    })
+}
+
+fn parse_pcapng(data: &[u8]) -> HeaderInspection {
+    let mut fields = vec![FieldAnnotation {
+        range: 0..4,
+        name: "SHB.block_type",
+        value: "0x0a0d0d0a (Section Header Block)".to_owned(),
+        accent_index: 0,
+    }];
+    if let Some(total_len) = read_u32_le(data, 4) {
+        fields.push(FieldAnnotation {
+            range: 4..8,
+            name: "SHB.total_len",
+            value: format!("{total_len} bytes"),
+            accent_index: 1,
+        });
+    }
+    if let Some(bom) = read_u32_le(data, 8) {
+        fields.push(FieldAnnotation {
+            range: 8..12,
+            name: "SHB.byte_order",
+            value: format!("0x{bom:08x}"),
+            accent_index: 2,
+        });
+    }
+    HeaderInspection {
+        format_name: "PCAPNG Next-Gen Capture",
+        mime_or_category: "application/x-pcapng",
+        summary: "PCAPNG Section Header Block (0x0A0D0D0A)".to_owned(),
+        fields,
+    }
+}
+
+fn parse_font(data: &[u8]) -> HeaderInspection {
+    let sig = sanitize_header_str(&data[..4]);
+    let (format_name, mime) = match sig.as_str() {
+        "wOFF" => ("WOFF Web Font", "font/woff"),
+        "wOF2" => ("WOFF2 Web Font", "font/woff2"),
+        _ => ("OpenType Font (CFF)", "font/otf"),
+    };
+    let mut fields = vec![FieldAnnotation {
+        range: 0..4,
+        name: "Font.signature",
+        value: format!("\"{sig}\" ({format_name})"),
+        accent_index: 0,
+    }];
+    if (sig == "wOFF" || sig == "wOF2")
+        && let Some(length) = read_u32_be(data, 8)
+    {
+        fields.push(FieldAnnotation {
+            range: 8..12,
+            name: "Font.length",
+            value: format!("{length} bytes"),
+            accent_index: 1,
+        });
+    }
+    HeaderInspection {
+        format_name,
+        mime_or_category: mime,
+        summary: format!("{format_name} container (\"{sig}\")"),
+        fields,
+    }
+}
+
+fn parse_dex(data: &[u8]) -> HeaderInspection {
+    let ver = sanitize_header_str(&data[4..7]);
+    let mut fields = vec![FieldAnnotation {
+        range: 0..8,
+        name: "DEX.magic",
+        value: format!("\"dex\\n{ver}\\0\" (Dalvik Executable)"),
+        accent_index: 0,
+    }];
+    if let Some(checksum) = read_u32_le(data, 8) {
+        fields.push(FieldAnnotation {
+            range: 8..12,
+            name: "DEX.checksum",
+            value: format!("0x{checksum:08x} (Adler32)"),
+            accent_index: 1,
+        });
+    }
+    if let Some(file_size) = read_u32_le(data, 32) {
+        fields.push(FieldAnnotation {
+            range: 32..36,
+            name: "DEX.file_size",
+            value: format!("{file_size} bytes"),
+            accent_index: 2,
+        });
+    }
+    HeaderInspection {
+        format_name: "Android DEX Bytecode",
+        mime_or_category: "application/vnd.android.dex",
+        summary: format!("Android Dalvik Executable v{ver}"),
+        fields,
+    }
+}
+
+fn parse_llvm_bc(data: &[u8]) -> HeaderInspection {
+    let _ = data;
+    HeaderInspection {
+        format_name: "LLVM IR Bitcode",
+        mime_or_category: "application/x-llvm-bc",
+        summary: "LLVM Bitcode bitstream (BC\\xc0\\xde)".to_owned(),
+        fields: vec![FieldAnnotation {
+            range: 0..4,
+            name: "LLVM.magic",
+            value: "\"BC\\xc0\\xde\" (LLVM Bitcode Stream)".to_owned(),
             accent_index: 0,
         }],
     }
