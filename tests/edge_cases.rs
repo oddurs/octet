@@ -430,3 +430,26 @@ fn test_hostile_filename_cannot_inject_terminal_controls() {
     );
     assert!(stdout.contains("evil·]0;pwned··[2J.bin"), "{stdout}");
 }
+
+#[test]
+fn test_hostile_labels_in_diff_and_strings_cards_are_neutralised() {
+    let hostile = "dir/evil\x1b]0;pwned\x07\x1b[2J\u{9b}.bin";
+    let theme = Theme::dark();
+    let no_controls = |rendered: &str| !rendered.chars().any(|c| c.is_control() && c != '\n');
+
+    let report = compute_diff(b"hello", b"help!", 8, 0, true);
+    let diff = render_diff_ansi(&report, hostile, hostile, 8, &theme, false);
+    assert!(
+        no_controls(&diff),
+        "control character in diff card: {diff:?}"
+    );
+    assert!(diff.contains("evil·]0;pwned··[2J·.bin"), "{diff}");
+
+    let strings = extract_strings(b"\0hello world\0", 4, 0);
+    let card = render_strings_ansi(&strings, 13, 4, Some(hostile), &theme, false);
+    assert!(
+        no_controls(&card),
+        "control character in strings card: {card:?}"
+    );
+    assert!(card.contains("evil·]0;pwned··[2J·.bin"), "{card}");
+}

@@ -663,7 +663,7 @@ fn format_class_percentages(stats: &ByteStats) -> String {
 
 /// Replaces C0/C1 controls and DEL with `·`. A filename is attacker-controlled, and an ESC or
 /// BEL in it would otherwise drive the terminal even with colour disabled.
-fn neutralise_controls(s: &str) -> String {
+pub(crate) fn neutralise_controls(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '·' } else { c })
         .collect()
