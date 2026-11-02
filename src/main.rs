@@ -151,6 +151,17 @@ impl CliConfig {
             return Err(conflict(first, second));
         }
         let mode = modes.first().copied();
+        // xxd caps its row layouts at 256 octets but not the plain stream or
+        // the C include array, whose rows have no layout to break.
+        if let Some(c) = self.cols
+            && c > 256
+            && self.style != ViewStyle::Plain
+            && !self.include_codegen
+        {
+            return Err(Error::InvalidArgument(format!(
+                "column count {c} exceeds maximum supported columns (256)"
+            )));
+        }
         // Reverse and codegen output are not reports, so there is no JSON form.
         if self.json && (self.reverse || self.include_codegen) {
             return Err(conflict("-j/--json", mode.unwrap_or_default()));
@@ -185,6 +196,11 @@ fn display_name(path: &Path) -> String {
 
 fn run_cli(args: Vec<OsString>) -> Result<()> {
     let mut cfg = parse_args(&args)?;
+    if cfg.output_path.is_none() && stdout_was_closed() {
+        return Err(Error::Io(io::Error::other(
+            "standard output is closed (Bad file descriptor)",
+        )));
+    }
     let stdout_is_tty = io::stdout().is_terminal();
 
     // If invoked with no arguments in an interactive terminal, show help instead of hanging on stdin.
@@ -220,6 +236,20 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
     }
 
     cfg.check_conflicts()?;
+    if let Some(out) = cfg.output_path.as_deref() {
+        for input in [cfg.input_path.as_deref(), cfg.diff_path.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if overwrites(input, out) {
+                return Err(Error::InvalidArgument(format!(
+                    "OUTFILE '{}' is the same file as INFILE '{}'; refusing to overwrite it",
+                    out.display(),
+                    input.display()
+                )));
+            }
+        }
+    }
 
     // An OUTFILE is never a terminal, so `auto` leaves it plain even when stdout is one.
     let output_is_tty = cfg.output_path.is_none() && stdout_is_tty;
@@ -360,7 +390,9 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
         upper_hex: cfg.upper_hex,
         autoskip,
         display_offset: base_disp_offset,
-        annotate_headers: cfg.annotate_headers,
+        // A header is only recognisable at byte 0 of the input; `-o` moves
+        // the displayed addresses, not the data.
+        annotate_headers: cfg.annotate_headers && start_off == 0,
         search_spans,
         theme: cfg.theme.clone(),
         color,
@@ -432,6 +464,57 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
     Ok(())
 }
 
+/// Whether writing OUTFILE `out` would destroy the regular file `input`. A
+/// device such as `/dev/stdout` may be both, but writing it destroys nothing,
+/// and an OUTFILE that does not exist yet cannot be the input.
+fn overwrites(input: &Path, out: &Path) -> bool {
+    let Ok(out_meta) = fs::metadata(out) else {
+        return false;
+    };
+    if !out_meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if let Ok(in_meta) = fs::metadata(input) {
+        use std::os::unix::fs::MetadataExt as _;
+        // Catches hard links, which have different canonical paths.
+        if (in_meta.dev(), in_meta.ino()) == (out_meta.dev(), out_meta.ino()) {
+            return true;
+        }
+    }
+    matches!(
+        (fs::canonicalize(input), fs::canonicalize(out)),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
+/// Whether stdout was closed when octet started (`octet f >&-`).
+///
+/// Before `main`, Rust's runtime reopens a closed descriptor 0-2 on
+/// `/dev/null` read-write, so writes "succeed" and the output vanishes
+/// unreported. A shell's `>/dev/null` opens it write-only, so only the
+/// runtime's replacement is readable; reading `/dev/null` consumes nothing.
+#[cfg(unix)]
+fn stdout_was_closed() -> bool {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(fd) = io::stdout().as_fd().try_clone_to_owned() else {
+        return true;
+    };
+    let stdout = File::from(fd);
+    let (Ok(out), Ok(null)) = (stdout.metadata(), fs::metadata("/dev/null")) else {
+        return false;
+    };
+    (out.dev(), out.ino(), out.rdev()) == (null.dev(), null.ino(), null.rdev())
+        && (&stdout).read(&mut [0u8; 1]).is_ok()
+}
+
+/// Off Unix there is no runtime substitution to see through.
+#[cfg(not(unix))]
+fn stdout_was_closed() -> bool {
+    false
+}
+
 /// Takes the value of option `flag`: its attached part when there is one,
 /// otherwise the next argument.
 fn flag_value(
@@ -461,13 +544,7 @@ fn flag_text(args: &[OsString], i: &mut usize, inline: Option<&str>, flag: &str)
 }
 
 fn parse_cols(raw: &str) -> Result<usize> {
-    let c = usize::try_from(parse_byte_count(raw)?).unwrap_or(usize::MAX);
-    if c > 256 {
-        return Err(Error::InvalidArgument(format!(
-            "column count {c} exceeds maximum supported columns (256)"
-        )));
-    }
-    Ok(c)
+    Ok(usize::try_from(parse_byte_count(raw)?).unwrap_or(usize::MAX))
 }
 
 /// Applies a long flag that takes no value; returns false if `key` is not one.
@@ -571,10 +648,23 @@ fn parse_args(args: &[OsString]) -> Result<CliConfig> {
                     cfg.inspect_offsets.push(v);
                 }
                 "strings" => {
-                    // The minimum length is optional, so it is only accepted
-                    // attached (`--strings=8`): a separate word is always the
-                    // next argument, never silently consumed.
-                    let min_len = match inline_val {
+                    // The minimum length is optional. A separate word is taken
+                    // only when it is all digits, so `--strings 8 fw.bin`
+                    // reads fw.bin while `--strings 1.bin` keeps its file; a
+                    // file named `8` is still reachable as `./8`.
+                    let separate = args
+                        .get(i + 1)
+                        .and_then(|a| a.to_str())
+                        .filter(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit()));
+                    let raw = match (inline_val, separate) {
+                        (Some(v), _) => Some(v),
+                        (None, Some(v)) => {
+                            i += 1;
+                            Some(v)
+                        }
+                        (None, None) => None,
+                    };
+                    let min_len = match raw {
                         Some(v) => usize::try_from(parse_byte_count(v)?).unwrap_or(4).max(1),
                         None => 4,
                     };
@@ -1096,8 +1186,8 @@ fn render_help(t: &Theme, c: bool) -> String {
         out,
         "{}",
         flag(
-            "--strings[=<MIN_LEN>]",
-            "Extract printable ASCII & graphic UTF-8 strings (default >= 4 chars)"
+            "--strings [N], --strings=N",
+            "Extract printable ASCII & UTF-8 strings of >= N chars (default: 4)"
         )
     );
     let _ = writeln!(
@@ -1204,7 +1294,7 @@ fn render_help(t: &Theme, c: bool) -> String {
             "Smart view with entropy telemetry & header annotations",
         ),
         (
-            "octet --diff v1.bin v2.bin",
+            "octet v1.bin --diff v2.bin",
             "Side-by-side binary delta comparison with context elision",
         ),
         (
@@ -1236,25 +1326,34 @@ fn render_help(t: &Theme, c: bool) -> String {
 fn render_completions(shell: &str) -> Result<String> {
     match shell.to_ascii_lowercase().as_str() {
         "bash" => Ok(String::from(
-            r#"_octet() {
-    local cur prev opts
+            r#"# Fills COMPREPLY one line per candidate, so a file name with spaces stays
+# one word; a while-read loop also runs on the bash 3.2 that macOS ships.
+_octet_reply() {
+    local word
     COMPREPLY=()
+    while IFS='' read -r word; do
+        COMPREPLY+=("${word}")
+    done < <(compgen "$@")
+}
+_octet() {
+    local cur prev opts
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     opts="-h --help -V --version -c --cols -g --groupsize -e --little-endian -b --bits -d --decimal -O --octal -u --upper -C --canonical --classic -q --compact -p --plain -s --seek -l -n --length -o --display-offset -a --autoskip -v --no-autoskip --diff -S --search --inspect --strings -i --include --lang --name -r --reverse -j --json --no-annotate --theme --color --svg --svg-title --completions --man"
     case "${prev}" in
-        --theme) COMPREPLY=( $(compgen -W "dark light" -- "${cur}") ); return 0 ;;
-        --color) COMPREPLY=( $(compgen -W "auto always never" -- "${cur}") ); return 0 ;;
-        --lang) COMPREPLY=( $(compgen -W "rust c go python ts zig csharp" -- "${cur}") ); return 0 ;;
-        --completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") ); return 0 ;;
+        --theme) _octet_reply -W "dark light" -- "${cur}"; return 0 ;;
+        --color) _octet_reply -W "auto always never" -- "${cur}"; return 0 ;;
+        --lang) _octet_reply -W "rust c go python ts zig csharp" -- "${cur}"; return 0 ;;
+        --completions) _octet_reply -W "bash zsh fish" -- "${cur}"; return 0 ;;
     esac
     if [[ ${cur} == -* ]]; then
-        COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+        _octet_reply -W "${opts}" -- "${cur}"
         return 0
     fi
-    COMPREPLY=( $(compgen -f -- "${cur}") )
+    _octet_reply -f -- "${cur}"
 }
-complete -F _octet octet
+# -o filenames quotes the inserted name and marks directories with a slash.
+complete -o filenames -F _octet octet
 "#,
         )),
         "zsh" => Ok(String::from(
@@ -1282,7 +1381,7 @@ _octet() {
         '--diff[Side-by-side binary diff]:file:_files' \
         '(-S --search)'{-S,--search}'[Highlight pattern]:pattern:' \
         '--inspect[Inspect multi-type values at offset]:offset:' \
-        '--strings=-[Extract printable ASCII and UTF-8 strings]::min_len:' \
+        '--strings=[Extract printable ASCII and UTF-8 strings]::min_len:' \
         '(-i --include)'{-i,--include}'[Generate source array]' \
         '--lang[Target language for codegen]:lang:(rust c go python ts zig csharp)' \
         '--name[Variable identifier for codegen]:name:' \
@@ -1322,7 +1421,7 @@ complete -c octet -s v -l no-autoskip -d "Expand all rows"
 complete -c octet -l diff -r -F -d "Side-by-side binary diff"
 complete -c octet -s S -l search -r -d "Highlight pattern"
 complete -c octet -l inspect -r -d "Inspect values at offset"
-complete -c octet -l strings -d "Extract printable ASCII and UTF-8 strings"
+complete -c octet -l strings -d "Extract strings of at least N chars (default 4)"
 complete -c octet -s i -l include -d "Generate source code array"
 complete -c octet -l lang -r -a "rust c go python ts zig csharp" -d "Codegen language"
 complete -c octet -l name -r -d "Variable identifier for codegen"
@@ -1343,21 +1442,38 @@ complete -c octet -l man -d "Render troff manual page"
     }
 }
 
+/// The page is dated the day it is generated, as help2man does, so the date
+/// needs no upkeep; `SOURCE_DATE_EPOCH` pins it for reproducible packages.
 fn render_manpage() -> String {
+    let epoch_secs = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        });
+    let (year, month, day) = civil_date(epoch_secs / 86_400);
     format!(
-        r#".TH OCTET 1 "2026" "octet {}" "User Commands"
+        r#".TH OCTET 1 "{year:04}-{month:02}-{day:02}" "octet {version}" "User Commands"
 .SH NAME
-octet \- information-design-first hex viewer, binary inspector, and xxd / hexdump replacement
+octet \- information-design-first hex viewer, binary inspector,
+and xxd / hexdump replacement
 .SH SYNOPSIS
 .B octet
 [\fIOPTIONS\fR] [\fIINFILE\fR [\fIOUTFILE\fR]]
 .SH DESCRIPTION
 .B octet
-is a modern, zero-dependency hexadecimal and multi-radix binary viewer engineered around visual hierarchy, semantic 7-class byte typography, automatic structural header recognition (31+ binary formats), side-by-side binary diffing, multi-type value inspection, multi-language code generation, and round-trip hex-to-binary reversal.
+is a modern, zero-dependency hexadecimal and multi-radix binary viewer
+engineered around visual hierarchy, semantic 7-class byte typography,
+automatic structural header recognition (31+ binary formats),
+side-by-side binary diffing, multi-type value inspection,
+multi-language code generation, and round-trip hex-to-binary reversal.
 .SH OPTIONS
 .TP
 \fB\-c\fR, \fB\-\-cols\fR \fIN\fR
-Format \fIN\fR octets per row (default: 16, binary: 6, plain: 30, max: 256).
+Format \fIN\fR octets per row (default: 16, binary: 6, plain: 30).
+At most 256, except with \fB\-p\fR and \fB\-i\fR, as in \fBxxd\fR.
 .TP
 \fB\-g\fR, \fB\-\-groupsize\fR \fIN\fR
 Group \fIN\fR octets per space-separated block (default: 2, \-e: 4).
@@ -1378,7 +1494,8 @@ Use uppercase hexadecimal digits (00..FF).
 Canonical BSD/GNU \fBhexdump \-C\fR layout.
 .TP
 \fB\-\-classic\fR / \fB\-q\fR, \fB\-\-compact\fR
-Strict \fBxxd\fR layout (\fB\-\-classic\fR) or cardless compact table (\fB\-q\fR).
+Strict \fBxxd\fR layout (\fB\-\-classic\fR)
+or cardless compact table (\fB\-q\fR).
 .TP
 \fB\-p\fR, \fB\-\-plain\fR
 Continuous plain hexadecimal stream (\fBxxd \-p\fR).
@@ -1399,13 +1516,18 @@ Collapse or expand consecutive identical/zero rows.
 Side-by-side binary delta comparison against \fIFILE\fR.
 .TP
 \fB\-S\fR, \fB\-\-search\fR \fIPATTERN\fR
-Highlight ASCII text or hex sequence (e.g. \fB\-S 'ELF'\fR or \fB\-S 0xfeedfacf\fR).
+Highlight ASCII text or hex sequence
+(e.g. \fB\-S 'ELF'\fR or \fB\-S 0xfeedfacf\fR).
 .TP
 \fB\-\-inspect\fR [\fI+-\fR]\fIOFFSET\fR
-Decode u8/i8/u16/u32/u64/i64/f32/f64/ULEB128/SLEB128/UTF-8 at \fIOFFSET\fR (repeatable).
+Decode u8/i8/u16/u32/u64/i64/f32/f64/ULEB128/SLEB128/UTF-8
+at \fIOFFSET\fR (repeatable).
 .TP
-\fB\-\-strings\fR[\fI=MIN_LEN\fR]
-Extract printable ASCII and graphic UTF-8 string literals (default >= 4 characters).
+\fB\-\-strings\fR [\fIN\fR], \fB\-\-strings=\fR\fIN\fR
+Extract printable ASCII and graphic UTF-8 string literals
+of at least \fIN\fR characters (default: 4).
+A separate \fIN\fR is taken only when it is all digits;
+name a file called \fB8\fR as \fB./8\fR.
 .TP
 \fB\-i\fR, \fB\-\-include\fR [\fB\-\-lang\fR \fIL\fR]
 Emit source array in rust, c (default), go, python, ts, zig, or csharp.
@@ -1446,6 +1568,20 @@ Print the version.
 \fB\-h\fR, \fB\-\-help\fR
 Print usage help.
 "#,
-        env!("CARGO_PKG_VERSION")
+        version = env!("CARGO_PKG_VERSION")
     )
+}
+
+/// The proleptic Gregorian (year, month, day) of `days` since 1970-01-01,
+/// by Howard Hinnant's `civil_from_days`, shifted so March starts the year.
+fn civil_date(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + u64::from(month <= 2), month, day)
 }
