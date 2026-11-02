@@ -180,16 +180,20 @@ impl ByteStats {
         }
 
         let entropy = compute_entropy(data);
-        let bucket_count = 12.min(data.len().max(1));
-        let chunk_size = (data.len() / bucket_count).max(1);
-        let mut sparkline_buckets = Vec::with_capacity(bucket_count);
-        if !data.is_empty() {
-            for chunk in data.chunks(chunk_size).take(bucket_count) {
-                let e = compute_entropy(chunk);
-                let level = ((e / 8.0) * 7.0).round().clamp(0.0, 7.0) as u8;
-                sparkline_buckets.push(level);
-            }
-        }
+        let len = data.len();
+        let bucket_count = 12.min(len);
+        // Bin i covers [i*len/n, (i+1)*len/n), so every byte lands in exactly one bin. The
+        // quotient/remainder split computes i*len/n without overflowing.
+        let bin_start = |i: usize| {
+            let (q, r) = (len / bucket_count, len % bucket_count);
+            i * q + i * r / bucket_count
+        };
+        let sparkline_buckets = (0..bucket_count)
+            .map(|i| {
+                let e = compute_entropy(&data[bin_start(i)..bin_start(i + 1)]);
+                ((e / 8.0) * 7.0).round().clamp(0.0, 7.0) as u8
+            })
+            .collect();
 
         Self {
             total_bytes: data.len(),
@@ -250,4 +254,38 @@ pub fn compute_entropy(data: &[u8]) -> f64 {
         }
     }
     entropy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buckets(data: &[u8]) -> Vec<u8> {
+        ByteStats::analyze(data, &classify_slice(data)).sparkline_buckets
+    }
+
+    #[test]
+    fn sparkline_bins_cover_trailing_bytes() {
+        let mut data = vec![0u8; 36];
+        data.extend_from_slice(b"qwertyuiopa");
+        let levels = buckets(&data);
+        assert_eq!(levels.len(), 12);
+        assert!(
+            levels[9..].iter().all(|&l| l > 0),
+            "tail entropy missing from sparkline: {levels:?}"
+        );
+
+        // A lone non-zero final byte must still land in the last bin.
+        let mut data = vec![0u8; 23];
+        data[22] = 0xff;
+        let levels = buckets(&data);
+        assert_eq!(levels.len(), 12);
+        assert!(levels[11] > 0, "{levels:?}");
+    }
+
+    #[test]
+    fn sparkline_uses_one_bin_per_byte_for_short_input() {
+        assert_eq!(buckets(b"abcde").len(), 5);
+        assert!(buckets(b"").is_empty());
+    }
 }

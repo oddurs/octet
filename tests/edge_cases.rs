@@ -404,3 +404,25 @@ fn test_sleb128_strings_extraction_codegen_and_junctions() {
         }
     }
 }
+
+#[test]
+fn test_hostile_filename_cannot_inject_terminal_controls() {
+    let dir = std::env::temp_dir().join("octet_hostile_label");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("evil\x1b]0;pwned\x07\x1b[2J.bin");
+    std::fs::write(&path, b"hello").expect("write hostile-named file");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_octet"))
+        .args(["--color", "never"])
+        .arg(&path)
+        .output()
+        .expect("run octet");
+    let _ = std::fs::remove_file(&path);
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 output");
+    assert!(
+        !stdout.chars().any(|c| c.is_control() && c != '\n'),
+        "control character reached the terminal: {stdout:?}"
+    );
+    assert!(stdout.contains("evil·]0;pwned··[2J.bin"), "{stdout}");
+}

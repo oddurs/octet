@@ -657,9 +657,34 @@ fn escape_xml(input: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            c if c.is_control() && !matches!(c, '\t' | '\n' | '\r') => out.push('·'),
+            // U+FFFE/U+FFFF are outside the XML 1.0 `Char` production (C0 controls too) and
+            // make the document ill-formed; C1 controls are legal but unprintable.
+            c if (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+                || matches!(c, '\u{fffe}' | '\u{ffff}') =>
+            {
+                out.push('·');
+            }
             _ => out.push(ch),
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// XML 1.0 `Char` production; anything outside it makes the document ill-formed.
+    fn is_xml_char(c: char) -> bool {
+        matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..)
+    }
+
+    #[test]
+    fn svg_output_contains_only_xml_chars() {
+        let hostile = "abc\u{fffe}\u{ffff}\u{1}\u{1b}\u{7f}\u{9b}def";
+        let svg = render_ansi_to_svg(hostile, hostile, &Theme::dark());
+        let bad: Vec<char> = svg.chars().filter(|&c| !is_xml_char(c)).collect();
+        assert!(bad.is_empty(), "XML-forbidden characters emitted: {bad:?}");
+        assert_eq!(escape_xml("a\u{fffe}b\u{ffff}c"), "a·b·c");
+    }
 }
