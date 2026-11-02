@@ -528,36 +528,6 @@ fn outfile_that_is_the_infile_is_refused() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn closed_stdout_is_an_error_but_dev_null_is_not() {
-    let input = scratch_file("closed_stdout_fd", "in.bin", b"hello world");
-    for flag in ["--classic", "-V"] {
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg(r#"exec "$0" "$1" "$2" >&-"#)
-            .arg(env!("CARGO_BIN_EXE_octet"))
-            .arg(flag)
-            .arg(&input)
-            .output()
-            .expect("run octet");
-        assert_fails_with(&out, "standard output is closed");
-    }
-
-    let out = octet()
-        .arg("--classic")
-        .arg(&input)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run octet");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
 #[test]
 fn plain_and_include_modes_have_no_column_maximum() {
     let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();

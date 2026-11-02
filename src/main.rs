@@ -196,11 +196,6 @@ fn display_name(path: &Path) -> String {
 
 fn run_cli(args: Vec<OsString>) -> Result<()> {
     let mut cfg = parse_args(&args)?;
-    if cfg.output_path.is_none() && stdout_was_closed() {
-        return Err(Error::Io(io::Error::other(
-            "standard output is closed (Bad file descriptor)",
-        )));
-    }
     let stdout_is_tty = io::stdout().is_terminal();
 
     // If invoked with no arguments in an interactive terminal, show help instead of hanging on stdin.
@@ -486,33 +481,6 @@ fn overwrites(input: &Path, out: &Path) -> bool {
         (fs::canonicalize(input), fs::canonicalize(out)),
         (Ok(a), Ok(b)) if a == b
     )
-}
-
-/// Whether stdout was closed when octet started (`octet f >&-`).
-///
-/// Before `main`, Rust's runtime reopens a closed descriptor 0-2 on
-/// `/dev/null` read-write, so writes "succeed" and the output vanishes
-/// unreported. A shell's `>/dev/null` opens it write-only, so only the
-/// runtime's replacement is readable; reading `/dev/null` consumes nothing.
-#[cfg(unix)]
-fn stdout_was_closed() -> bool {
-    use std::os::fd::AsFd as _;
-    use std::os::unix::fs::MetadataExt as _;
-    let Ok(fd) = io::stdout().as_fd().try_clone_to_owned() else {
-        return true;
-    };
-    let stdout = File::from(fd);
-    let (Ok(out), Ok(null)) = (stdout.metadata(), fs::metadata("/dev/null")) else {
-        return false;
-    };
-    (out.dev(), out.ino(), out.rdev()) == (null.dev(), null.ino(), null.rdev())
-        && (&stdout).read(&mut [0u8; 1]).is_ok()
-}
-
-/// Off Unix there is no runtime substitution to see through.
-#[cfg(not(unix))]
-fn stdout_was_closed() -> bool {
-    false
 }
 
 /// Takes the value of option `flag`: its attached part when there is one,
