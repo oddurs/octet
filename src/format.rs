@@ -152,7 +152,7 @@ pub fn analyze_buffer(data: &[u8], opts: &FormatOptions) -> AnalyzedBuffer {
     while i < raw_chunks.len() {
         let (start_idx, chunk) = raw_chunks[i];
         rows.push(DisplayRow::Data {
-            offset: opts.display_offset.saturating_add(start_idx as u64),
+            offset: opts.display_offset.wrapping_add(start_idx as u64),
             start_index: start_idx,
             bytes: chunk.to_vec(),
         });
@@ -186,8 +186,8 @@ pub fn analyze_buffer(data: &[u8], opts: &FormatOptions) -> AnalyzedBuffer {
                     None
                 };
                 rows.push(DisplayRow::Elided {
-                    start_offset: opts.display_offset.saturating_add(first_dup_idx as u64),
-                    end_offset: opts.display_offset.saturating_add(last_dup_idx as u64),
+                    start_offset: opts.display_offset.wrapping_add(first_dup_idx as u64),
+                    end_offset: opts.display_offset.wrapping_add(last_dup_idx as u64),
                     row_count: duplicate_count,
                     byte_count: duplicate_count * cols,
                     uniform_byte,
@@ -215,7 +215,14 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
     }
 
     let analyzed = analyze_buffer(data, opts);
-    let off_w = compute_offset_width(data.len(), opts.display_offset);
+    // xxd and hexdump print each offset with `%08x`, so a dump that crosses 4 GiB grows its
+    // offset column mid-stream. Smart and Compact draw a fixed grid instead, which needs one
+    // width for every row: the widest offset in the dump.
+    let off_w = if matches!(opts.style, ViewStyle::Classic | ViewStyle::Canonical) {
+        8
+    } else {
+        compute_offset_width(data.len(), opts.display_offset)
+    };
     let card_width = compute_card_width(opts, off_w);
     let mut out = String::with_capacity(analyzed.rows.len() * (card_width + 64) + 1024);
 
@@ -304,7 +311,7 @@ pub fn render_dump(data: &[u8], opts: &FormatOptions) -> String {
     }
 
     if opts.style == ViewStyle::Canonical {
-        let end_off = opts.display_offset.saturating_add(data.len() as u64);
+        let end_off = opts.display_offset.wrapping_add(data.len() as u64);
         let off_str = opts.theme.format_offset(end_off, off_w, false, opts.color);
         let _ = writeln!(out, "{off_str}");
     } else if opts.style == ViewStyle::Smart {
@@ -342,16 +349,19 @@ fn render_plain(data: &[u8], cols: usize, upper: bool) -> String {
     out
 }
 
+/// Clamps the group to one row, as xxd does; a wider group would only pad the row with
+/// blanks, and `-e` padding scales with the group size.
 fn effective_group_size(opts: &FormatOptions) -> usize {
     let cols = opts.cols.max(1);
     if opts.group_size == 0 {
         cols
     } else {
-        opts.group_size
+        opts.group_size.min(cols)
     }
 }
 
 fn compute_offset_width(data_len: usize, display_offset: u64) -> usize {
+    // Saturating, not wrapping: a dump that wraps past u64::MAX still shows 16-digit offsets.
     let max_off = display_offset.saturating_add(data_len.saturating_sub(1) as u64);
     format!("{max_off:08x}").len()
 }
@@ -398,7 +408,10 @@ fn render_header_banner(
 
     let _ = writeln!(out, "{}", t.paint(&top_bar, t.border, c));
 
-    let label = opts.label.as_deref().unwrap_or("stdin");
+    let label = opts
+        .label
+        .as_deref()
+        .map_or_else(|| String::from("stdin"), neutralise_controls);
     let size_str = format!(
         "{} B (0x{:x})",
         analyzed.stats.total_bytes, analyzed.stats.total_bytes
@@ -648,6 +661,14 @@ fn format_class_percentages(stats: &ByteStats) -> String {
     )
 }
 
+/// Replaces C0/C1 controls and DEL with `·`. A filename is attacker-controlled, and an ESC or
+/// BEL in it would otherwise drive the terminal even with colour disabled.
+fn neutralise_controls(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '·' } else { c })
+        .collect()
+}
+
 fn pad_or_clip(s: &str, width: usize) -> String {
     let count = s.chars().count();
     if count > width {
@@ -824,12 +845,12 @@ fn build_row_context_note(
         && span.start < row_range.end
         && span.end > row_range.start
     {
-        let match_off = opts.display_offset.saturating_add(span.start as u64);
+        let match_off = opts.display_offset.wrapping_add(span.start as u64);
         return (format!("★ match @ 0x{match_off:02x}"), t.byte_control, true);
     }
     for span in &opts.search_spans {
         if span.start < row_range.end && span.end > row_range.start {
-            let match_off = opts.display_offset.saturating_add(span.start as u64);
+            let match_off = opts.display_offset.wrapping_add(span.start as u64);
             return (format!("★ match @ 0x{match_off:02x}"), t.byte_control, true);
         }
     }
@@ -1217,7 +1238,7 @@ pub fn render_json_report(
     let match_offsets: Vec<String> = opts
         .search_spans
         .iter()
-        .map(|r| (opts.display_offset.saturating_add(r.start as u64)).to_string())
+        .map(|r| (opts.display_offset.wrapping_add(r.start as u64)).to_string())
         .collect();
     let _ = writeln!(out, "  \"search_matches\": [{}],", match_offsets.join(", "));
 
@@ -1296,4 +1317,104 @@ fn escape_json(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(style: ViewStyle) -> FormatOptions {
+        FormatOptions {
+            style,
+            autoskip: false,
+            annotate_headers: false,
+            color: false,
+            ..FormatOptions::default()
+        }
+    }
+
+    fn row_offsets(rendered: &str, sep: char) -> Vec<&str> {
+        rendered
+            .lines()
+            .map(|l| l.split(sep).next().unwrap_or(""))
+            .collect()
+    }
+
+    #[test]
+    fn classic_little_endian_group_wider_than_row_clamps_to_row() {
+        let mut opts = plain(ViewStyle::Classic);
+        opts.little_endian = true;
+        opts.group_size = 32;
+        // Expected bytes come from xxd 2025-08-24 (`printf ab | xxd -e -g 32`).
+        assert_eq!(
+            render_dump(b"ab", &opts),
+            "00000000:                             6261  ab\n"
+        );
+
+        opts.group_size = usize::MAX;
+        assert_eq!(
+            render_dump(b"ab", &opts),
+            "00000000:                             6261  ab\n"
+        );
+    }
+
+    #[test]
+    fn banner_label_control_characters_are_neutralised() {
+        let mut opts = plain(ViewStyle::Smart);
+        opts.label = Some(String::from("evil\x1b]0;pwned\x07\x1b[2J\u{9b}\u{7f}.bin"));
+        let rendered = render_dump(b"hello", &opts);
+        assert!(
+            !rendered.chars().any(|c| c.is_control() && c != '\n'),
+            "control character reached the terminal: {rendered:?}"
+        );
+        assert!(rendered.contains("evil·]0;pwned··[2J··.bin"), "{rendered}");
+    }
+
+    #[test]
+    fn classic_and_canonical_pad_each_offset_to_eight_digits_only() {
+        let data = [0u8; 33];
+
+        let mut opts = plain(ViewStyle::Classic);
+        opts.display_offset = 0xffff_fff0;
+        let rendered = render_dump(&data, &opts);
+        assert_eq!(
+            row_offsets(&rendered, ':'),
+            ["fffffff0", "100000000", "100000010"]
+        );
+
+        let mut opts = plain(ViewStyle::Canonical);
+        opts.group_size = 1;
+        opts.display_offset = 0xffff_fff0;
+        let rendered = render_dump(&data, &opts);
+        assert_eq!(
+            row_offsets(&rendered, ' '),
+            ["fffffff0", "100000000", "100000010", "100000011"]
+        );
+    }
+
+    #[test]
+    fn offsets_wrap_past_u64_max_like_xxd() {
+        let data = [0u8; 33];
+        let mut opts = plain(ViewStyle::Classic);
+        opts.display_offset = 0xffff_ffff_ffff_fff0;
+        let rendered = render_dump(&data, &opts);
+        assert_eq!(
+            row_offsets(&rendered, ':'),
+            ["fffffffffffffff0", "00000000", "00000010"]
+        );
+
+        let mut opts = plain(ViewStyle::Smart);
+        opts.autoskip = true;
+        opts.display_offset = 0xffff_ffff_ffff_fff0;
+        let analyzed = analyze_buffer(&[0u8; 64], &opts);
+        let DisplayRow::Elided {
+            start_offset,
+            end_offset,
+            ..
+        } = analyzed.rows[1]
+        else {
+            panic!("expected an elided run: {:?}", analyzed.rows);
+        };
+        assert_eq!((start_offset, end_offset), (0, 0x2f));
+    }
 }

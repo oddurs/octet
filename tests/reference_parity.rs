@@ -123,6 +123,9 @@ fn test_xxd_classic_default_group_cols_upper_parity() {
         &["-c", "24"],
         &["-c", "32"],
         &["-c", "12", "-g", "4", "-u"],
+        // Offsets crossing 4 GiB and wrapping past u64::MAX.
+        &["-o", "0xfffffff0"],
+        &["-o", "0xfffffffffffffff0"],
     ];
 
     for (name, payload) in reference_corpora() {
@@ -155,6 +158,8 @@ fn test_xxd_little_endian_and_binary_bits_parity() {
         &["-e", "-g", "8"],
         &["-e", "-c", "6"],
         &["-e", "-c", "8", "-g", "4"],
+        &["-e", "-g", "32"],
+        &["-e", "-c", "8", "-g", "1000000"],
         &["-b"],
         &["-b", "-c", "4"],
         &["-b", "-g", "2"],
@@ -201,6 +206,8 @@ fn normalize_vim_le_extra_space(s: &str, flags: &[&str]) -> String {
         }
         i += 1;
     }
+    // xxd clamps an oversized group to one row.
+    let group_size = group_size.min(cols);
     let groups = cols.div_ceil(group_size);
     let gap_idx = 10 + groups * (group_size * 2) + groups.saturating_sub(1);
 
@@ -353,6 +360,41 @@ fn test_hexdump_canonical_mode_reference_parity() {
                 "canonical parity mismatch vs /usr/bin/hexdump on corpus '{name}' with flags {flags:?}"
             );
         }
+    }
+    let _ = std::fs::remove_file(&tmp_path);
+}
+
+#[test]
+fn test_hexdump_canonical_offsets_past_4gib_parity() {
+    if !has_system_tool("/usr/bin/hexdump") {
+        return;
+    }
+    let tmp_path = std::env::temp_dir().join("octet_hexdump_4gib_sparse.bin");
+    let path_str = tmp_path.to_str().unwrap();
+    let tail = prng_bytes(48, 0x0bad_f00d);
+    // A sparse file costs no disk; skip where the filesystem cannot make one.
+    let made = std::fs::File::create(&tmp_path).and_then(|mut f| {
+        use std::io::{Seek, SeekFrom};
+        f.seek(SeekFrom::Start(0xffff_fff0))?;
+        f.write_all(&tail)
+    });
+    if made.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+
+    for flags in [["-C", "-s", "0xffffffe0"], ["-C", "-s", "0xfffffff8"]] {
+        let mut args = flags.to_vec();
+        args.push(path_str);
+        let expected = run_with_stdin("/usr/bin/hexdump", &args, &[]);
+        let mut oc_args = vec!["--color=never"];
+        oc_args.extend_from_slice(&args);
+        let actual = run_with_stdin(octet_bin(), &oc_args, &[]);
+        assert_eq!(
+            String::from_utf8_lossy(&actual),
+            String::from_utf8_lossy(&expected),
+            "canonical parity mismatch vs /usr/bin/hexdump with flags {flags:?}"
+        );
     }
     let _ = std::fs::remove_file(&tmp_path);
 }
