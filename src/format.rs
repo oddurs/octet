@@ -682,14 +682,14 @@ pub(crate) fn neutralise_controls(s: &str) -> String {
 
 /// Per-dump values every data row needs.
 #[derive(Clone, Copy)]
-struct RowLayout {
+pub(crate) struct RowLayout {
     /// Width of the offset column.
-    off_w: usize,
+    pub(crate) off_w: usize,
     /// Result of [`spans_are_sorted`] for `opts.search_spans`, computed once per dump.
-    spans_sorted: bool,
+    pub(crate) spans_sorted: bool,
 }
 
-fn render_data_row(
+pub(crate) fn render_data_row(
     out: &mut String,
     offset: u64,
     start_index: usize,
@@ -939,7 +939,7 @@ fn build_row_context_note(
 
 /// Whether `spans` are ordered and non-overlapping, as [`crate::inspect::find_pattern_spans`]
 /// returns them, so a binary search can answer "does any span touch this row".
-fn spans_are_sorted(spans: &[Range<usize>]) -> bool {
+pub(crate) fn spans_are_sorted(spans: &[Range<usize>]) -> bool {
     spans.iter().all(|r| r.start <= r.end) && spans.windows(2).all(|w| w[0].end <= w[1].start)
 }
 

@@ -4,10 +4,12 @@
 //! Side-by-side binary diff engine (`--diff <file>`).
 
 use std::fmt::Write as _;
+use std::io;
 use std::path::Path;
 
 use crate::classify::ByteClass;
 use crate::theme::Theme;
+use crate::width::pad_or_clip;
 
 /// Summary metrics for a binary comparison between two buffers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,83 +60,231 @@ pub fn compute_diff(
     display_offset: u64,
     autoskip: bool,
 ) -> DiffReport {
-    let cols = cols.max(4);
-    let max_len = left.len().max(right.len());
-    let total_rows = max_len.div_ceil(cols);
-    let mut changed_bytes = 0;
-    let mut changed_rows = 0;
-    let mut raw_rows = Vec::with_capacity(total_rows);
+    Diff::new(left, right, cols, display_offset, autoskip).report()
+}
 
-    for row_idx in 0..total_rows {
-        let start = row_idx * cols;
-        let offset = display_offset.saturating_add(start as u64);
-        let mut l_vec = Vec::with_capacity(cols);
-        let mut r_vec = Vec::with_capacity(cols);
-        let mut row_diff = false;
+/// A comparison of two buffers that is laid out row by row on demand, so that rendering
+/// it holds one row at a time rather than a [`DiffRow`] for every row of the inputs.
+#[derive(Debug, Clone, Copy)]
+pub struct Diff<'a> {
+    left: &'a [u8],
+    right: &'a [u8],
+    cols: usize,
+    display_offset: u64,
+    autoskip: bool,
+}
 
-        for col in 0..cols {
-            let idx = start + col;
-            let lb = left.get(idx).copied();
-            let rb = right.get(idx).copied();
-            if lb != rb && (lb.is_some() || rb.is_some()) {
-                changed_bytes += 1;
-                row_diff = true;
-            }
-            l_vec.push(lb);
-            r_vec.push(rb);
+/// Where a shown row comes from, before its bytes are copied out.
+enum Planned {
+    Data { row: usize, has_diff: bool },
+    Elided { first: usize, count: usize },
+}
+
+impl<'a> Diff<'a> {
+    /// Prepares a comparison with the same parameters as [`compute_diff`].
+    #[must_use]
+    pub fn new(
+        left: &'a [u8],
+        right: &'a [u8],
+        cols: usize,
+        display_offset: u64,
+        autoskip: bool,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            cols: cols.max(4),
+            display_offset,
+            autoskip,
         }
-        if row_diff {
-            changed_rows += 1;
-        }
-        raw_rows.push((offset, l_vec, r_vec, row_diff));
     }
 
-    let mut rows = Vec::new();
-    let mut i = 0;
-    while i < raw_rows.len() {
-        if autoskip && !raw_rows[i].3 {
-            // Keep 1 context row immediately adjacent to a changed row.
-            let prev_changed = i > 0 && raw_rows[i - 1].3;
-            if !prev_changed {
-                let mut run_end = i;
-                while run_end < raw_rows.len() && !raw_rows[run_end].3 {
-                    run_end += 1;
-                }
-                // Leave 1 context row before the next changed row if there is one.
-                let elide_until = if run_end < raw_rows.len() && run_end > i + 1 {
-                    run_end - 1
-                } else {
-                    run_end
-                };
-                let count = elide_until.saturating_sub(i);
-                if count >= 2 {
-                    rows.push(DiffRow::Elided {
-                        start_offset: raw_rows[i].0,
-                        row_count: count,
-                        // The final row of the longer buffer may be short.
-                        byte_count: (elide_until * cols).min(max_len) - i * cols,
-                    });
-                    i = elide_until;
-                    continue;
+    /// The full report, as [`compute_diff`] returns it.
+    #[must_use]
+    pub fn report(&self) -> DiffReport {
+        let mut rows = Vec::new();
+        let mut report = self.plan(|p| rows.push(self.materialize(&p)));
+        report.rows = rows;
+        report
+    }
+
+    /// The report's totals with `rows` left empty: all that [`render_diff_json`] reads.
+    #[must_use]
+    pub fn summary(&self) -> DiffReport {
+        self.plan(|_| {})
+    }
+
+    /// Writes what [`render_diff_ansi`] returns for [`Diff::report`], rendering one row at
+    /// a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error from writing `out`.
+    pub fn write_ansi(
+        &self,
+        mut out: impl io::Write,
+        left_label: &str,
+        right_label: &str,
+        theme: &Theme,
+        color: bool,
+    ) -> io::Result<()> {
+        // The header shows the totals and is as wide as the last row's offset, so a
+        // first pass finds those and a second renders the rows.
+        let mut last_offset = 0;
+        let summary = self.plan(|p| last_offset = self.offset_of(&p));
+        let layout = DiffLayout::new(self.cols, last_offset, theme, color);
+        let mut text = String::new();
+        layout.head(&mut text, &summary, left_label, right_label);
+        let mut result = Ok(());
+        self.plan(|p| {
+            if result.is_ok() {
+                layout.row(&mut text, &self.materialize(&p));
+                if text.len() >= 64 * 1024 {
+                    result = out.write_all(text.as_bytes());
+                    text.clear();
                 }
             }
-        }
-        let (offset, left_b, right_b, has_diff) = raw_rows[i].clone();
-        rows.push(DiffRow::Data {
-            offset,
-            left: left_b,
-            right: right_b,
-            has_diff,
         });
-        i += 1;
+        result?;
+        layout.foot(&mut text);
+        out.write_all(text.as_bytes())
     }
 
-    DiffReport {
-        left_len: left.len(),
-        right_len: right.len(),
-        changed_bytes,
-        changed_rows,
-        rows,
+    /// Walks both inputs once, passing each row that will be shown to `emit` and
+    /// returning the totals. The rules are those of `autoskip`: an unchanged run of rows
+    /// collapses when at least two of its rows can go, keeping the row on either side of
+    /// a changed row as context.
+    fn plan(&self, mut emit: impl FnMut(Planned)) -> DiffReport {
+        let cols = self.cols;
+        let total_rows = self.left.len().max(self.right.len()).div_ceil(cols);
+        let mut changed_bytes = 0;
+        let mut changed_rows = 0;
+        // The first row of an unchanged run whose rows are not shown yet.
+        let mut run_start = None;
+        let mut prev_changed = false;
+
+        let close_run = |emit: &mut dyn FnMut(Planned), first: usize, end: usize| {
+            let len = end - first;
+            let data = |row| Planned::Data {
+                row,
+                has_diff: false,
+            };
+            if end == total_rows {
+                if len >= 2 {
+                    emit(Planned::Elided { first, count: len });
+                } else {
+                    emit(data(first));
+                }
+            } else if len >= 3 {
+                emit(Planned::Elided {
+                    first,
+                    count: len - 1,
+                });
+                emit(data(end - 1));
+            } else {
+                for row in first..end {
+                    emit(data(row));
+                }
+            }
+        };
+
+        for row in 0..total_rows {
+            let changes = self.changes_in(row);
+            if changes > 0 {
+                changed_bytes += changes;
+                changed_rows += 1;
+                if let Some(first) = run_start.take() {
+                    close_run(&mut emit, first, row);
+                }
+                emit(Planned::Data {
+                    row,
+                    has_diff: true,
+                });
+                prev_changed = true;
+            } else if !self.autoskip || prev_changed {
+                emit(Planned::Data {
+                    row,
+                    has_diff: false,
+                });
+                prev_changed = false;
+            } else if run_start.is_none() {
+                run_start = Some(row);
+            }
+        }
+        if let Some(first) = run_start {
+            close_run(&mut emit, first, total_rows);
+        }
+
+        DiffReport {
+            left_len: self.left.len(),
+            right_len: self.right.len(),
+            changed_bytes,
+            changed_rows,
+            rows: Vec::new(),
+        }
+    }
+
+    /// The bytes of `row` on one side; shorter than a row past that side's end.
+    fn side(data: &[u8], start: usize, cols: usize) -> &[u8] {
+        let from = start.min(data.len());
+        &data[from..(start + cols).min(data.len())]
+    }
+
+    /// Positions in `row` where the sides differ, a byte present on only one side included.
+    fn changes_in(&self, row: usize) -> usize {
+        let start = row * self.cols;
+        let l = Self::side(self.left, start, self.cols);
+        let r = Self::side(self.right, start, self.cols);
+        if l == r {
+            return 0;
+        }
+        let common = l.len().min(r.len());
+        let differing = l[..common]
+            .iter()
+            .zip(&r[..common])
+            .filter(|(a, b)| a != b)
+            .count();
+        differing + l.len().max(r.len()) - common
+    }
+
+    fn row_offset(&self, row: usize) -> u64 {
+        self.display_offset.saturating_add((row * self.cols) as u64)
+    }
+
+    fn offset_of(&self, planned: &Planned) -> u64 {
+        match *planned {
+            Planned::Data { row, .. } => self.row_offset(row),
+            Planned::Elided { first, .. } => self.row_offset(first),
+        }
+    }
+
+    fn materialize(&self, planned: &Planned) -> DiffRow {
+        let cols = self.cols;
+        match *planned {
+            Planned::Data { row, has_diff } => {
+                let start = row * cols;
+                let bytes = |data: &[u8]| {
+                    (start..start + cols)
+                        .map(|i| data.get(i).copied())
+                        .collect()
+                };
+                DiffRow::Data {
+                    offset: self.row_offset(row),
+                    left: bytes(self.left),
+                    right: bytes(self.right),
+                    has_diff,
+                }
+            }
+            Planned::Elided { first, count } => {
+                let max_len = self.left.len().max(self.right.len());
+                DiffRow::Elided {
+                    start_offset: self.row_offset(first),
+                    row_count: count,
+                    // The final row of the longer buffer may be short.
+                    byte_count: ((first + count) * cols).min(max_len) - first * cols,
+                }
+            }
+        }
     }
 }
 
@@ -148,10 +298,6 @@ pub fn render_diff_ansi(
     theme: &Theme,
     color: bool,
 ) -> String {
-    let cols = cols.max(4);
-    let mut out = String::new();
-    let left_short = crate::format::neutralise_controls(basename(left_label));
-    let right_short = crate::format::neutralise_controls(basename(right_label));
     let max_off = report
         .rows
         .iter()
@@ -161,57 +307,99 @@ pub fn render_diff_ansi(
         })
         .max()
         .unwrap_or(0);
-    let off_w = format!("{max_off:08x}").len();
-    let side_w = 4 * cols + 2;
-    let table_w = (off_w + 8) + 2 * side_w;
-    let inner_w = table_w.saturating_sub(2);
-    let top_bar = format!("╭{}╮", "─".repeat(inner_w));
-    let bot_bar = format!("╰{}╯", "─".repeat(inner_w));
-
-    let _ = writeln!(out, "{}", theme.paint(&top_bar, theme.border, color));
-    let max_len = report.left_len.max(report.right_len);
-    let similarity = if max_len == 0 {
-        100.0
-    } else {
-        ((max_len.saturating_sub(report.changed_bytes) as f64) / (max_len as f64)) * 100.0
-    };
-    let summary = format!(
-        " ◈ BINARY DIFF  │  {} Δ bytes across {} changed rows  │  {similarity:.1}% identical",
-        report.changed_bytes, report.changed_rows
-    );
-    let padded = pad_diff_cell(&summary, inner_w);
-    let _ = writeln!(
-        out,
-        "{}{}{}",
-        theme.paint("│", theme.border, color),
-        theme.paint_bold(&padded, theme.fg_primary, color),
-        theme.paint("│", theme.border, color),
-    );
-    let off_hdr = format!(" {:<width$}", "OFFSET", width = off_w.saturating_sub(2));
-    let left_hdr = pad_diff_cell(&format!("⊖ {left_short} ({} B)", report.left_len), side_w);
-    let right_hdr = pad_diff_cell(
-        &format!("⊕ {right_short} ({} B)", report.right_len),
-        side_w.saturating_sub(1),
-    );
-    let j1 = off_hdr.chars().count() + 1;
-    let j2 = j1 + 1 + 1 + side_w + 2;
-    let hdr_mid_bar = build_diff_junction_bar('├', '┤', '┬', inner_w, &[j1, j2]);
-    let hdr_bot_bar = build_diff_junction_bar('╰', '╯', '┴', inner_w, &[j1, j2]);
-    let _ = writeln!(out, "{}", theme.paint(&hdr_mid_bar, theme.border, color));
-    let _ = writeln!(
-        out,
-        "{}{} {} {}  {}  {}{}",
-        theme.paint("│", theme.border, color),
-        theme.paint_bold(&off_hdr, theme.fg_muted, color),
-        theme.paint("│", theme.border, color),
-        theme.paint_bold(&left_hdr, theme.diff_del, color),
-        theme.paint("│", theme.border, color),
-        theme.paint_bold(&right_hdr, theme.diff_add, color),
-        theme.paint("│", theme.border, color),
-    );
-    let _ = writeln!(out, "{}", theme.paint(&hdr_bot_bar, theme.border, color));
-
+    let layout = DiffLayout::new(cols.max(4), max_off, theme, color);
+    let mut out = String::new();
+    layout.head(&mut out, report, left_label, right_label);
     for row in &report.rows {
+        layout.row(&mut out, row);
+    }
+    layout.foot(&mut out);
+    out
+}
+
+/// The table geometry shared by the head, every row and the foot of a rendered diff.
+struct DiffLayout<'a> {
+    cols: usize,
+    off_w: usize,
+    side_w: usize,
+    table_w: usize,
+    inner_w: usize,
+    theme: &'a Theme,
+    color: bool,
+}
+
+impl<'a> DiffLayout<'a> {
+    fn new(cols: usize, max_off: u64, theme: &'a Theme, color: bool) -> Self {
+        let off_w = format!("{max_off:08x}").len();
+        let side_w = 4 * cols + 2;
+        let table_w = (off_w + 8) + 2 * side_w;
+        Self {
+            cols,
+            off_w,
+            side_w,
+            table_w,
+            inner_w: table_w.saturating_sub(2),
+            theme,
+            color,
+        }
+    }
+
+    fn head(&self, out: &mut String, report: &DiffReport, left_label: &str, right_label: &str) {
+        let (theme, color, inner_w, side_w) = (self.theme, self.color, self.inner_w, self.side_w);
+        let left_short = crate::format::neutralise_controls(basename(left_label));
+        let right_short = crate::format::neutralise_controls(basename(right_label));
+        let top_bar = format!("╭{}╮", "─".repeat(inner_w));
+
+        let _ = writeln!(out, "{}", theme.paint(&top_bar, theme.border, color));
+        let max_len = report.left_len.max(report.right_len);
+        let similarity = if max_len == 0 {
+            100.0
+        } else {
+            ((max_len.saturating_sub(report.changed_bytes) as f64) / (max_len as f64)) * 100.0
+        };
+        let summary = format!(
+            " ◈ BINARY DIFF  │  {} Δ bytes across {} changed rows  │  {similarity:.1}% identical",
+            report.changed_bytes, report.changed_rows
+        );
+        let padded = pad_or_clip(&summary, inner_w);
+        let _ = writeln!(
+            out,
+            "{}{}{}",
+            theme.paint("│", theme.border, color),
+            theme.paint_bold(&padded, theme.fg_primary, color),
+            theme.paint("│", theme.border, color),
+        );
+        let off_hdr = format!(
+            " {:<width$}",
+            "OFFSET",
+            width = self.off_w.saturating_sub(2)
+        );
+        let left_hdr = pad_or_clip(&format!("⊖ {left_short} ({} B)", report.left_len), side_w);
+        let right_hdr = pad_or_clip(
+            &format!("⊕ {right_short} ({} B)", report.right_len),
+            side_w.saturating_sub(1),
+        );
+        let j1 = off_hdr.chars().count() + 1;
+        let j2 = j1 + 1 + 1 + side_w + 2;
+        let hdr_mid_bar = build_diff_junction_bar('├', '┤', '┬', inner_w, &[j1, j2]);
+        let hdr_bot_bar = build_diff_junction_bar('╰', '╯', '┴', inner_w, &[j1, j2]);
+        let _ = writeln!(out, "{}", theme.paint(&hdr_mid_bar, theme.border, color));
+        let _ = writeln!(
+            out,
+            "{}{} {} {}  {}  {}{}",
+            theme.paint("│", theme.border, color),
+            theme.paint_bold(&off_hdr, theme.fg_muted, color),
+            theme.paint("│", theme.border, color),
+            theme.paint_bold(&left_hdr, theme.diff_del, color),
+            theme.paint("│", theme.border, color),
+            theme.paint_bold(&right_hdr, theme.diff_add, color),
+            theme.paint("│", theme.border, color),
+        );
+        let _ = writeln!(out, "{}", theme.paint(&hdr_bot_bar, theme.border, color));
+    }
+
+    fn row(&self, out: &mut String, row: &DiffRow) {
+        let (theme, color, off_w) = (self.theme, self.color, self.off_w);
         match row {
             DiffRow::Elided {
                 start_offset,
@@ -219,9 +407,9 @@ pub fn render_diff_ansi(
                 byte_count,
             } => {
                 let off_str = theme.format_offset(*start_offset, off_w, false, color);
-                let msg = pad_diff_cell(
+                let msg = pad_or_clip(
                     &format!(" ⋮ ⋯ {row_count} identical rows ({byte_count} bytes) unchanged ⋯"),
-                    table_w.saturating_sub(off_w + 1),
+                    self.table_w.saturating_sub(off_w + 1),
                 );
                 let _ = writeln!(
                     out,
@@ -242,8 +430,8 @@ pub fn render_diff_ansi(
                 } else {
                     theme.paint("│", theme.border, color)
                 };
-                let left_side = format_diff_side(left, right, true, cols, theme, color);
-                let right_side = format_diff_side(right, left, false, cols, theme, color);
+                let left_side = format_diff_side(left, right, true, self.cols, theme, color);
+                let right_side = format_diff_side(right, left, false, self.cols, theme, color);
                 let _ = writeln!(
                     out,
                     "{off_str} {marker} {left_side}  {}  {right_side}",
@@ -253,19 +441,23 @@ pub fn render_diff_ansi(
         }
     }
 
-    let _ = writeln!(out, "{}", theme.paint(&top_bar, theme.border, color));
-    let footer_plain =
-        " Δ Modified Row   ⊖ Left / Removed Byte   ⊕ Right / Added Byte   · Unchanged";
-    let footer_padded = pad_diff_cell(footer_plain, inner_w);
-    let _ = writeln!(
-        out,
-        "{}{}{}",
-        theme.paint("│", theme.border, color),
-        theme.paint(&footer_padded, theme.fg_muted, color),
-        theme.paint("│", theme.border, color),
-    );
-    let _ = writeln!(out, "{}", theme.paint(&bot_bar, theme.border, color));
-    out
+    fn foot(&self, out: &mut String) {
+        let (theme, color, inner_w) = (self.theme, self.color, self.inner_w);
+        let top_bar = format!("╭{}╮", "─".repeat(inner_w));
+        let bot_bar = format!("╰{}╯", "─".repeat(inner_w));
+        let _ = writeln!(out, "{}", theme.paint(&top_bar, theme.border, color));
+        let footer_plain =
+            " Δ Modified Row   ⊖ Left / Removed Byte   ⊕ Right / Added Byte   · Unchanged";
+        let footer_padded = pad_or_clip(footer_plain, inner_w);
+        let _ = writeln!(
+            out,
+            "{}{}{}",
+            theme.paint("│", theme.border, color),
+            theme.paint(&footer_padded, theme.fg_muted, color),
+            theme.paint("│", theme.border, color),
+        );
+        let _ = writeln!(out, "{}", theme.paint(&bot_bar, theme.border, color));
+    }
 }
 
 fn build_diff_junction_bar(
@@ -286,24 +478,6 @@ fn build_diff_junction_bar(
     }
     s.push(right);
     s
-}
-
-fn pad_diff_cell(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count > width {
-        if width >= 4 {
-            let mut clipped: String = s.chars().take(width - 2).collect();
-            clipped.push('…');
-            clipped.push(' ');
-            clipped
-        } else {
-            let mut clipped: String = s.chars().take(width.saturating_sub(1)).collect();
-            clipped.push('…');
-            clipped
-        }
-    } else {
-        format!("{s}{}", " ".repeat(width - count))
-    }
 }
 
 /// Renders a [`DiffReport`] as a standalone RFC 8259 JSON object.
@@ -414,4 +588,33 @@ fn format_diff_side(
         theme.paint("│", theme.border, color),
         theme.paint("│", theme.border, color)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::width::str_width;
+
+    /// Cells pad by terminal columns, so a CJK file name, two columns per
+    /// ideograph, leaves the card's right border straight.
+    #[test]
+    fn a_wide_file_name_keeps_every_card_line_the_same_width() {
+        let left = b"hello, world".to_vec();
+        let mut right = left.clone();
+        right[3] = b'L';
+        let report = compute_diff(&left, &right, 8, 0, true);
+        let card = render_diff_ansi(
+            &report,
+            "数据/旧版本.bin",
+            "新版本.bin",
+            8,
+            &Theme::dark(),
+            false,
+        );
+        let widths: Vec<usize> = card.lines().map(str_width).collect();
+        assert!(
+            widths.iter().all(|&w| w == widths[0]),
+            "line widths {widths:?} in:\n{card}"
+        );
+    }
 }

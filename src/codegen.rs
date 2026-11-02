@@ -55,54 +55,53 @@ pub fn generate_code(
     upper: bool,
 ) -> String {
     let cols = cols.max(1);
-    let ident = identifier_for(var_name.unwrap_or("octet_data"), lang);
-    let mut out = String::new();
+    let is_c = lang == CodeLanguage::C;
+    let mut out = declaration_open(var_name, lang, data.len() as u64);
+    write_hex_grid(&mut out, data, cols, upper, is_c, grid_indent(lang), is_c);
+    out.push_str(&declaration_close(var_name, lang, data.len() as u64));
+    out
+}
 
+/// The lines before the byte grid. Bare C output (`xxd -i` reading stdin) has none.
+pub(crate) fn declaration_open(var_name: Option<&str>, lang: CodeLanguage, len: u64) -> String {
+    let ident = identifier_for(var_name.unwrap_or("octet_data"), lang);
     match lang {
+        CodeLanguage::C if var_name.is_none() => String::new(),
+        CodeLanguage::C => format!("unsigned char {ident}[] = {{\n"),
+        CodeLanguage::Rust => format!("pub const {ident}: &[u8; {len}] = &[\n"),
+        CodeLanguage::Go => format!("var {ident} = []byte{{\n"),
+        CodeLanguage::Python => format!("{ident} = bytes([\n"),
+        CodeLanguage::TypeScript => format!("export const {ident} = new Uint8Array([\n"),
+        CodeLanguage::Zig => format!("pub const {ident} = [_]u8{{\n"),
+        CodeLanguage::CSharp => format!("public static readonly byte[] {ident} = new byte[] {{\n"),
+    }
+}
+
+/// The lines after the byte grid; C declares the length here, as xxd does.
+pub(crate) fn declaration_close(var_name: Option<&str>, lang: CodeLanguage, len: u64) -> String {
+    match lang {
+        CodeLanguage::C if var_name.is_none() => String::new(),
         CodeLanguage::C => {
-            if var_name.is_none() {
-                if !data.is_empty() {
-                    write_hex_grid(&mut out, data, cols, upper, true, "  ", true);
-                }
-            } else {
-                let _ = writeln!(out, "unsigned char {ident}[] = {{");
-                write_hex_grid(&mut out, data, cols, upper, true, "  ", true);
-                let _ = writeln!(out, "}};");
-                let _ = writeln!(out, "unsigned int {ident}_len = {};", data.len());
-            }
+            let ident = identifier_for(var_name.unwrap_or("octet_data"), lang);
+            format!("}};\nunsigned int {ident}_len = {len};\n")
         }
-        CodeLanguage::Rust => {
-            let _ = writeln!(out, "pub const {ident}: &[u8; {}] = &[", data.len());
-            write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
-            let _ = writeln!(out, "];");
-        }
-        CodeLanguage::Go => {
-            let _ = writeln!(out, "var {ident} = []byte{{");
-            write_hex_grid(&mut out, data, cols, upper, false, "\t", false);
-            let _ = writeln!(out, "}}");
-        }
-        CodeLanguage::Python => {
-            let _ = writeln!(out, "{ident} = bytes([");
-            write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
-            let _ = writeln!(out, "])");
-        }
-        CodeLanguage::TypeScript => {
-            let _ = writeln!(out, "export const {ident} = new Uint8Array([");
-            write_hex_grid(&mut out, data, cols, upper, false, "  ", false);
-            let _ = writeln!(out, "]);");
-        }
-        CodeLanguage::Zig => {
-            let _ = writeln!(out, "pub const {ident} = [_]u8{{");
-            write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
-            let _ = writeln!(out, "}};");
-        }
-        CodeLanguage::CSharp => {
-            let _ = writeln!(out, "public static readonly byte[] {ident} = new byte[] {{");
-            write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
-            let _ = writeln!(out, "}};");
+        CodeLanguage::Rust => String::from("];\n"),
+        CodeLanguage::Go => String::from("}\n"),
+        CodeLanguage::Python => String::from("])\n"),
+        CodeLanguage::TypeScript => String::from("]);\n"),
+        CodeLanguage::Zig | CodeLanguage::CSharp => String::from("};\n"),
+    }
+}
+
+/// The indentation of each grid row, in the language's customary style.
+pub(crate) fn grid_indent(lang: CodeLanguage) -> &'static str {
+    match lang {
+        CodeLanguage::C | CodeLanguage::TypeScript => "  ",
+        CodeLanguage::Go => "\t",
+        CodeLanguage::Rust | CodeLanguage::Python | CodeLanguage::Zig | CodeLanguage::CSharp => {
+            "    "
         }
     }
-    out
 }
 
 fn write_hex_grid(
