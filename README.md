@@ -1,6 +1,7 @@
 # `octet`
 
 [![CI](https://github.com/oddurs/octet/actions/workflows/ci.yml/badge.svg)](https://github.com/oddurs/octet/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/octet-cli.svg)](https://crates.io/crates/octet-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Information-design-first hex viewer, binary inspector, and modern `xxd` / `hexdump` alternative.**
@@ -63,6 +64,10 @@ When inspecting a binary from offset `0x00`, `octet` automatically recognizes an
 ## Installation & Usage
 
 ```bash
+# Install from crates.io (installs the `octet` binary)
+cargo install octet-cli
+
+# Or install from source
 cargo install --path .
 ```
 

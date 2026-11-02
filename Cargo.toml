@@ -1,5 +1,5 @@
 [package]
-name = "octet"
+name = "octet-cli"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.87"
@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/oddurs/octet"
 homepage = "https://github.com/oddurs/octet"
-documentation = "https://docs.rs/octet"
+documentation = "https://docs.rs/octet-cli"
 keywords = ["hex", "hexdump", "xxd", "binary", "inspector"]
 categories = [
     "command-line-utilities",
