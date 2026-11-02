@@ -143,6 +143,10 @@ fn test_adversarial_and_corrupted_magic_headers() {
     let mut mz = vec![0u8; 64];
     mz[0] = b'M';
     mz[1] = b'Z';
+    // Sane DOS fields (e_cblp, e_cp, e_cparhdr) so only `e_lfanew` is corrupt.
+    mz[2..4].copy_from_slice(&0x90u16.to_le_bytes());
+    mz[4..6].copy_from_slice(&3u16.to_le_bytes());
+    mz[8..10].copy_from_slice(&4u16.to_le_bytes());
     mz[60..64].copy_from_slice(&0xffff_fffe_u32.to_le_bytes());
     let pe_hdr = inspect_header(&mz).expect("MZ header should still parse");
     assert_eq!(pe_hdr.format_name, "PE / MZ Executable");
