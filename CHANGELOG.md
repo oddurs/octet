@@ -19,7 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - View styles: `Smart` (default), `Compact` (`-q`), `Classic` (`--classic` / `--xxd`), `Canonical` (`-C` / `--canonical` / `--hexdump`), and `Plain` (`-p`).
   - Radices & grouping: Hexadecimal, Binary (`-b`), Octal (`-O`), and Decimal (`-d`), with configurable `--cols` (`-c`), `--groupsize` (`-g`), and little-endian grouping (`-e`).
   - Side-by-side binary diffing (`--diff <FILE>`) with context row elision and similarity percentage telemetry.
-  - Multi-type value inspector (`--inspect <OFFSET>`) decoding `u8`/`i8`, `u16`/`i16`, `u32`/`i32`, `u64`/`i64`, `f32`, `f64`, `ULEB128` varints, and `UTF-8` codepoints.
-  - Multi-language byte array code generation (`-i` / `--lang <rust|c|go|python|ts>`).
+  - Multi-type value inspector (`--inspect <[+-]OFFSET>`, repeatable) decoding `u8`/`i8`, `u16`/`i16`, `u32`/`i32`, `u64`/`i64`, `f32`, `f64`, `ULEB128` & `SLEB128` varints, and `UTF-8` codepoints.
+  - Printable ASCII & graphic UTF-8 string literal extractor (`--strings[=<MIN_LEN>]`) with encoding (`ASCII`/`UTF-8`), null-termination (`\0`), and JSON (`-j`) reporting.
+  - Multi-language byte array code generation (`-i` / `--lang <rust|c|go|python|ts|zig|csharp>`).
   - Round-trip hex-to-binary reversal (`-r` / `--reverse`) across `octet`, `xxd`, `hexdump -C`, `-b` binary, and `-r -p` plain streams.
   - Structured RFC 8259 JSON report export (`-j` / `--json`), shell completions (`--completions <bash|zsh|fish>`), and troff manual page generation (`--man`).

@@ -30,6 +30,8 @@ pub struct ValueInspection {
     pub float64: Option<(f64, f64)>,
     /// Unsigned LEB128 varint value and byte length, if valid.
     pub uleb128: Option<(u64, usize)>,
+    /// Signed LEB128 varint value and byte length, if valid.
+    pub sleb128: Option<(i64, usize)>,
     /// Decoded UTF-8 character at the start of the slice, if valid.
     pub utf8_char: Option<(char, usize)>,
 }
@@ -94,6 +96,7 @@ impl ValueInspection {
         };
 
         let uleb128 = decode_uleb128(slice);
+        let sleb128 = decode_sleb128(slice);
         let utf8_char = decode_first_utf8_char(slice);
 
         Some(Self {
@@ -106,6 +109,7 @@ impl ValueInspection {
             float32,
             float64,
             uleb128,
+            sleb128,
             utf8_char,
         })
     }
@@ -196,12 +200,20 @@ impl ValueInspection {
                 color,
             );
         }
-        if let Some(((ule, _ile), (ube, _ibe))) = self.int64 {
+        if let Some(((ule, ile), (ube, ibe))) = self.int64 {
+            let le_str = if ile < 0 {
+                format!("{ile} (i64)")
+            } else {
+                format!("{ule}")
+            };
+            let be_str = if ibe < 0 {
+                format!("0x{ube:016x} ({ibe})")
+            } else {
+                format!("0x{ube:016x}")
+            };
             let line = format!(
-                "   {:<16} : {:<26} {:<16} : 0x{ube:016x}",
-                "u64 (LE)",
-                format!("{ule}"),
-                "u64 (BE hex)",
+                "   {:<16} : {:<26} {:<16} : {be_str}",
+                "u64 / i64 (LE)", le_str, "u64 / i64 (BE)",
             );
             write_card_row(
                 &mut out,
@@ -243,9 +255,11 @@ impl ValueInspection {
                 color,
             );
         }
-        let uleb_info = match self.uleb128 {
-            Some((val, len)) => format!("{val} ({len} B)"),
-            None => String::from("n/a (unterminated/overflow)"),
+        let leb_info = match (self.uleb128, self.sleb128) {
+            (Some((uval, ulen)), Some((sval, _))) => format!("{uval} / {sval:+} ({ulen} B)"),
+            (Some((uval, ulen)), None) => format!("{uval} / overflow ({ulen} B)"),
+            (None, Some((sval, slen))) => format!("overflow / {sval:+} ({slen} B)"),
+            (None, None) => String::from("n/a (unterminated/overflow)"),
         };
         let utf8_info = match self.utf8_char {
             Some((ch, clen)) => format!("U+{:04X} {:?} ({clen} B)", ch as u32, ch),
@@ -253,7 +267,7 @@ impl ValueInspection {
         };
         let line = format!(
             "   {:<16} : {:<26} {:<16} : {}",
-            "ULEB128 Varint", uleb_info, "UTF-8 Codepoint", utf8_info
+            "ULEB / SLEB128", leb_info, "UTF-8 Codepoint", utf8_info
         );
         write_card_row(
             &mut out,
@@ -310,6 +324,26 @@ fn decode_uleb128(slice: &[u8]) -> Option<(u64, usize)> {
             return Some((result, i + 1));
         }
         shift += 7;
+    }
+    None
+}
+
+fn decode_sleb128(slice: &[u8]) -> Option<(i64, usize)> {
+    let mut result = 0i64;
+    let mut shift = 0u32;
+    for (i, &byte) in slice.iter().take(10).enumerate() {
+        let low = byte & 0x7f;
+        if shift == 63 && low != 0x00 && low != 0x7f {
+            return None;
+        }
+        result |= i64::from(low).wrapping_shl(shift);
+        shift += 7;
+        if (byte & 0x80) == 0 {
+            if shift < 64 && (byte & 0x40) != 0 {
+                result |= (!0i64).wrapping_shl(shift);
+            }
+            return Some((result, i + 1));
+        }
     }
     None
 }
@@ -375,4 +409,229 @@ pub fn find_pattern_spans(data: &[u8], needle: &[u8]) -> Vec<Range<usize>> {
         }
     }
     spans
+}
+
+/// A contiguous printable ASCII or graphic UTF-8 string literal extracted from a binary buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedString {
+    /// Displayed starting byte offset of the string.
+    pub offset: u64,
+    /// Length of the string in raw bytes.
+    pub byte_len: usize,
+    /// Length of the string in Unicode scalar values (`char`s).
+    pub char_len: usize,
+    /// Whether the string contains multi-byte UTF-8 characters.
+    pub is_utf8_multibyte: bool,
+    /// Whether the string is immediately followed by a `0x00` NUL terminator byte.
+    pub null_terminated: bool,
+    /// Sanitized single-line representation of the extracted string.
+    pub text: String,
+}
+
+/// Scans `data` for contiguous graphic UTF-8 / printable ASCII strings of at least `min_chars`
+/// characters (`--strings`).
+#[must_use]
+pub fn extract_strings(data: &[u8], min_chars: usize, display_offset: u64) -> Vec<ExtractedString> {
+    let min_chars = min_chars.max(1);
+    let mut results = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        let start = i;
+        let mut text = String::new();
+        let mut char_len = 0usize;
+        let mut has_multibyte = false;
+
+        while i < data.len() {
+            let b = data[i];
+            if (0x20..=0x7e).contains(&b) {
+                text.push(b as char);
+                char_len += 1;
+                i += 1;
+            } else if b == b'\t' {
+                text.push(' ');
+                char_len += 1;
+                i += 1;
+            } else if b >= 0xc2
+                && let Some((ch, clen)) = decode_first_utf8_char(&data[i..])
+                && clen > 1
+                && !ch.is_control()
+            {
+                text.push(ch);
+                char_len += 1;
+                has_multibyte = true;
+                i += clen;
+            } else {
+                break;
+            }
+        }
+
+        if char_len >= min_chars && text.chars().any(|c| !c.is_whitespace()) {
+            let null_terminated = data.get(i) == Some(&0x00);
+            results.push(ExtractedString {
+                offset: display_offset.saturating_add(start as u64),
+                byte_len: i - start,
+                char_len,
+                is_utf8_multibyte: has_multibyte,
+                null_terminated,
+                text,
+            });
+        }
+
+        if i == start {
+            i += 1;
+        }
+    }
+
+    results
+}
+
+/// Renders extracted strings (`--strings`) as an ANSI-styled 106-column table card.
+#[must_use]
+pub fn render_strings_ansi(
+    strings: &[ExtractedString],
+    total_bytes: usize,
+    min_chars: usize,
+    label: Option<&str>,
+    theme: &Theme,
+    color: bool,
+) -> String {
+    let max_off = strings.last().map_or(0, |s| s.offset);
+    let off_w = format!("{max_off:08x}").len();
+    let card_w = 106 + off_w.saturating_sub(8);
+    let inner_w = card_w - 2;
+    let mut out = String::with_capacity(strings.len() * (card_w + 32) + 512);
+
+    let top = format!("╭{}╮", "─".repeat(inner_w));
+    let mid = format!("├{}┤", "─".repeat(inner_w));
+    let bot = format!("╰{}╯", "─".repeat(inner_w));
+
+    let _ = writeln!(out, "{}", theme.paint(&top, theme.border, color));
+    let lbl = label.unwrap_or("stdin");
+    let hdr_plain = format!(
+        " ◈ STRING TABLE · {lbl}  │  {} strings (min {min_chars} chars) in {total_bytes} B",
+        strings.len()
+    );
+    write_card_row(
+        &mut out,
+        &hdr_plain,
+        inner_w,
+        theme,
+        theme.offset_active,
+        true,
+        color,
+    );
+    let _ = writeln!(out, "{}", theme.paint(&mid, theme.border, color));
+
+    let col_hdr = format!(
+        " {:<off_w$}  {:>6}  {:<8}  STRING LITERAL",
+        "OFFSET", "BYTES", "ENCODING"
+    );
+    write_card_row(
+        &mut out,
+        &col_hdr,
+        inner_w,
+        theme,
+        theme.fg_muted,
+        true,
+        color,
+    );
+    let _ = writeln!(out, "{}", theme.paint(&bot, theme.border, color));
+
+    if strings.is_empty() {
+        let msg = format!("  (no printable strings of length >= {min_chars} found)");
+        let _ = writeln!(out, "{}", theme.paint(&msg, theme.fg_muted, color));
+        return out;
+    }
+
+    let lit_budget = card_w.saturating_sub(off_w + 2 + 6 + 2 + 8 + 4);
+    for item in strings {
+        let off_str = theme.format_offset(item.offset, off_w, false, color);
+        let len_str = format!("{:>5}B", item.byte_len);
+        let enc_tag = match (item.is_utf8_multibyte, item.null_terminated) {
+            (true, true) => "UTF-8\\0 ",
+            (true, false) => "UTF-8   ",
+            (false, true) => "ASCII\\0 ",
+            (false, false) => "ASCII   ",
+        };
+        let enc_color = if item.is_utf8_multibyte {
+            theme.byte_utf8
+        } else {
+            theme.byte_ascii
+        };
+        let clipped_lit = clip_string_literal(&item.text, lit_budget);
+        let _ = writeln!(
+            out,
+            "{off_str}  {}  {}  {} {}",
+            theme.paint(&len_str, theme.fg_secondary, color),
+            theme.paint_bold(enc_tag, enc_color, color),
+            theme.paint("▸", enc_color, color),
+            theme.paint(&clipped_lit, theme.fg_primary, color),
+        );
+    }
+
+    out
+}
+
+/// Renders extracted strings (`--strings -j`) as a standalone RFC 8259 JSON report.
+#[must_use]
+pub fn render_strings_json(
+    strings: &[ExtractedString],
+    total_bytes: usize,
+    min_chars: usize,
+    label: Option<&str>,
+) -> String {
+    let lbl = label.unwrap_or("stdin");
+    let mut out = String::from("{\n");
+    let _ = writeln!(out, "  \"mode\": \"strings\",");
+    let _ = writeln!(out, "  \"label\": \"{}\",", escape_json_str(lbl));
+    let _ = writeln!(out, "  \"total_bytes\": {total_bytes},");
+    let _ = writeln!(out, "  \"min_chars\": {min_chars},");
+    let _ = writeln!(out, "  \"count\": {},", strings.len());
+    let _ = writeln!(out, "  \"strings\": [");
+    for (idx, s) in strings.iter().enumerate() {
+        let comma = if idx + 1 < strings.len() { "," } else { "" };
+        let enc = if s.is_utf8_multibyte { "utf8" } else { "ascii" };
+        let _ = writeln!(
+            out,
+            "    {{ \"offset\": {}, \"byte_len\": {}, \"char_len\": {}, \"encoding\": \"{enc}\", \"null_terminated\": {}, \"text\": \"{}\" }}{comma}",
+            s.offset,
+            s.byte_len,
+            s.char_len,
+            s.null_terminated,
+            escape_json_str(&s.text)
+        );
+    }
+    let _ = writeln!(out, "  ]");
+    out.push_str("}\n");
+    out
+}
+
+fn clip_string_literal(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        format!("\"{s}\"")
+    } else {
+        let take = max_chars.saturating_sub(2);
+        let prefix: String = s.chars().take(take).collect();
+        format!("\"{prefix}\"…")
+    }
+}
+
+fn escape_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }

@@ -57,7 +57,10 @@ pub use crate::format::{
     AnalyzedBuffer, DisplayRow, FormatOptions, Radix, ViewStyle, analyze_buffer, render_dump,
     render_json_report,
 };
-pub use crate::inspect::{ValueInspection, find_pattern_spans, parse_search_pattern};
+pub use crate::inspect::{
+    ExtractedString, ValueInspection, extract_strings, find_pattern_spans, parse_search_pattern,
+    render_strings_ansi, render_strings_json,
+};
 pub use crate::magic::{FieldAnnotation, HeaderInspection, inspect_header};
 pub use crate::reverse::{reverse_dump, strip_ansi};
 pub use crate::svg::render_ansi_to_svg;

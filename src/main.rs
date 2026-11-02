@@ -11,9 +11,9 @@ use std::process::ExitCode;
 
 use octet::{
     CodeLanguage, ColorMode, Error, FormatOptions, Radix, Result, Theme, ValueInspection,
-    ViewStyle, compute_diff, find_pattern_spans, generate_code, parse_byte_count,
+    ViewStyle, compute_diff, extract_strings, find_pattern_spans, generate_code, parse_byte_count,
     parse_search_pattern, render_ansi_to_svg, render_diff_ansi, render_diff_json, render_dump,
-    render_json_report, reverse_dump,
+    render_json_report, render_strings_ansi, render_strings_json, reverse_dump,
 };
 
 fn main() -> ExitCode {
@@ -61,7 +61,8 @@ struct CliConfig {
     length: Option<u64>,
     display_offset: Option<u64>,
     search_patterns: Vec<String>,
-    inspect_offset: Option<String>,
+    inspect_offsets: Vec<String>,
+    strings_min_len: Option<usize>,
     diff_path: Option<String>,
     svg_out: Option<String>,
     svg_title: Option<String>,
@@ -112,7 +113,8 @@ impl Default for CliConfig {
             length: None,
             display_offset: None,
             search_patterns: Vec::new(),
-            inspect_offset: None,
+            inspect_offsets: Vec::new(),
+            strings_min_len: None,
             diff_path: None,
             svg_out: None,
             svg_title: None,
@@ -214,6 +216,41 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
+    // String literal extraction mode (`--strings`)
+    if let Some(min_chars) = cfg.strings_min_len {
+        let label = cfg.input_path.as_ref().map(|p| {
+            Path::new(p)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(p)
+        });
+        let extracted = extract_strings(sliced, min_chars, base_disp_offset);
+        if cfg.json {
+            let json_out = render_strings_json(&extracted, sliced.len(), min_chars, label);
+            write_output(cfg.output_path.as_deref(), json_out.as_bytes())?;
+            return Ok(());
+        }
+        let rendered = render_strings_ansi(
+            &extracted,
+            sliced.len(),
+            min_chars,
+            label,
+            &cfg.theme,
+            color,
+        );
+        if let Some(ref svg_path) = cfg.svg_out {
+            let default_title = match label {
+                Some(l) => format!("octet --strings {l}"),
+                None => String::from("octet --strings"),
+            };
+            let title = cfg.svg_title.as_deref().unwrap_or(&default_title);
+            let svg_doc = render_ansi_to_svg(&rendered, title, &cfg.theme);
+            fs::write(svg_path, svg_doc)?;
+        }
+        write_output(cfg.output_path.as_deref(), rendered.as_bytes())?;
+        return Ok(());
+    }
+
     // Standard / Smart / Classic / Plain hex or radix dump
     let default_cols = if cfg.style == ViewStyle::Plain {
         30
@@ -273,30 +310,40 @@ fn run_cli(args: Vec<String>) -> Result<()> {
         color,
     };
 
-    let inspection = if let Some(ref insp_str) = cfg.inspect_offset {
-        let target_off = parse_byte_count(insp_str)?;
-        let rel_idx =
-            usize::try_from(target_off.saturating_sub(base_disp_offset)).unwrap_or(usize::MAX);
+    let mut inspections = Vec::with_capacity(cfg.inspect_offsets.len());
+    for insp_str in &cfg.inspect_offsets {
+        let trimmed = insp_str.trim();
+        let rel_idx = if let Some(neg) = trimmed.strip_prefix('-') {
+            let back = usize::try_from(parse_byte_count(neg)?).unwrap_or(usize::MAX);
+            if back == 0 || back > sliced.len() {
+                return Err(Error::InvalidOffset(format!(
+                    "inspect offset -{neg} is outside buffer range (0..0x{:x})",
+                    sliced.len()
+                )));
+            }
+            sliced.len() - back
+        } else {
+            let target_off = parse_byte_count(trimmed)?;
+            usize::try_from(target_off.saturating_sub(base_disp_offset)).unwrap_or(usize::MAX)
+        };
         if let Some(insp) = ValueInspection::at(sliced, rel_idx, base_disp_offset) {
-            Some(insp)
+            inspections.push(insp);
         } else {
             return Err(Error::InvalidOffset(format!(
-                "inspect offset 0x{target_off:x} is outside buffer range (0..0x{:x})",
+                "inspect offset '{insp_str}' is outside buffer range (0..0x{:x})",
                 sliced.len()
             )));
         }
-    } else {
-        None
-    };
+    }
 
     if cfg.json {
-        let json_out = render_json_report(sliced, &opts, inspection.as_ref());
+        let json_out = render_json_report(sliced, &opts, inspections.first());
         write_output(cfg.output_path.as_deref(), json_out.as_bytes())?;
         return Ok(());
     }
 
     let mut rendered = render_dump(sliced, &opts);
-    if let Some(ref insp) = inspection {
+    for insp in &inspections {
         rendered.push_str(&insp.render_ansi(&cfg.theme, color));
     }
 
@@ -409,7 +456,26 @@ fn parse_args(args: &[String]) -> Result<CliConfig> {
                     cfg.search_patterns.push(next_val("search")?);
                 }
                 "inspect" => {
-                    cfg.inspect_offset = Some(next_val("inspect")?);
+                    cfg.inspect_offsets.push(next_val("inspect")?);
+                }
+                "strings" => {
+                    let min_len = if let Some(ref v) = inline_val {
+                        usize::try_from(parse_byte_count(v)?).unwrap_or(4).max(1)
+                    } else if i + 1 < args.len()
+                        && args[i + 1]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_digit())
+                        && args.len().saturating_sub(i + 2) >= 1
+                    {
+                        i += 1;
+                        usize::try_from(parse_byte_count(&args[i])?)
+                            .unwrap_or(4)
+                            .max(1)
+                    } else {
+                        4
+                    };
+                    cfg.strings_min_len = Some(min_len);
                 }
                 "diff" => {
                     cfg.diff_path = Some(next_val("diff")?);
@@ -704,6 +770,7 @@ fn suggest_long_flag(unknown: &str) -> Option<&'static str> {
         "no-annotate",
         "search",
         "inspect",
+        "strings",
         "diff",
         "svg",
         "svg-title",
@@ -929,8 +996,16 @@ fn render_help(t: &Theme, c: bool) -> String {
         out,
         "{}",
         flag(
-            "--inspect <OFFSET>",
-            "Decode u8/i8/u16/u32/u64/f32/f64/ULEB128/UTF-8 at <OFFSET>"
+            "--inspect <[+-]OFFSET>",
+            "Decode u8..i64/f32/f64/ULEB128/SLEB128/UTF-8 at <OFFSET>"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        flag(
+            "--strings[=<MIN_LEN>]",
+            "Extract printable ASCII & graphic UTF-8 strings (default >= 4 chars)"
         )
     );
     let _ = writeln!(
@@ -938,7 +1013,7 @@ fn render_help(t: &Theme, c: bool) -> String {
         "{}",
         flag(
             "-i, --include [--lang <L>]",
-            "Emit source array in rust, c (default), go, python, or ts"
+            "Emit source array in rust, c (default), go, python, ts, zig, or csharp"
         )
     );
     let _ = writeln!(
@@ -1045,11 +1120,11 @@ fn render_completions(shell: &str) -> Result<String> {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="-h --help -V --version -c --cols -g --groupsize -e --little-endian -b --bits -d --decimal -O --octal -u --upper -C --canonical --classic -q --compact -p --plain -s --seek -l -n --length -o --display-offset -a --autoskip -v --no-autoskip --diff -S --search --inspect -i --include --lang --name -r --reverse -j --json --no-annotate --theme --color --svg --svg-title --completions --man"
+    opts="-h --help -V --version -c --cols -g --groupsize -e --little-endian -b --bits -d --decimal -O --octal -u --upper -C --canonical --classic -q --compact -p --plain -s --seek -l -n --length -o --display-offset -a --autoskip -v --no-autoskip --diff -S --search --inspect --strings -i --include --lang --name -r --reverse -j --json --no-annotate --theme --color --svg --svg-title --completions --man"
     case "${prev}" in
         --theme) COMPREPLY=( $(compgen -W "dark light" -- "${cur}") ); return 0 ;;
         --color) COMPREPLY=( $(compgen -W "auto always never" -- "${cur}") ); return 0 ;;
-        --lang) COMPREPLY=( $(compgen -W "rust c go python ts" -- "${cur}") ); return 0 ;;
+        --lang) COMPREPLY=( $(compgen -W "rust c go python ts zig csharp" -- "${cur}") ); return 0 ;;
         --completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") ); return 0 ;;
     esac
     if [[ ${cur} == -* ]]; then
@@ -1086,8 +1161,9 @@ _octet() {
         '--diff[Side-by-side binary diff]:file:_files' \
         '(-S --search)'{-S,--search}'[Highlight pattern]:pattern:' \
         '--inspect[Inspect multi-type values at offset]:offset:' \
+        '--strings[Extract printable ASCII and UTF-8 strings]' \
         '(-i --include)'{-i,--include}'[Generate source array]' \
-        '--lang[Target language for codegen]:lang:(rust c go python ts)' \
+        '--lang[Target language for codegen]:lang:(rust c go python ts zig csharp)' \
         '--name[Variable identifier for codegen]:name:' \
         '(-r --reverse)'{-r,--reverse}'[Reverse hex dump to binary]' \
         '(-j --json)'{-j,--json}'[Emit structured JSON report]' \
@@ -1124,8 +1200,9 @@ complete -c octet -s v -l no-autoskip -d "Expand all rows"
 complete -c octet -l diff -r -F -d "Side-by-side binary diff"
 complete -c octet -s S -l search -r -d "Highlight pattern"
 complete -c octet -l inspect -r -d "Inspect values at offset"
+complete -c octet -l strings -d "Extract printable ASCII and UTF-8 strings"
 complete -c octet -s i -l include -d "Generate source code array"
-complete -c octet -l lang -r -a "rust c go python ts" -d "Codegen language"
+complete -c octet -l lang -r -a "rust c go python ts zig csharp" -d "Codegen language"
 complete -c octet -s r -l reverse -d "Reverse hex dump to binary"
 complete -c octet -s j -l json -d "Emit structured JSON report"
 complete -c octet -l no-annotate -d "Disable magic header annotations"
@@ -1200,11 +1277,14 @@ Side-by-side binary delta comparison against \fIFILE\fR.
 \fB\-S\fR, \fB\-\-search\fR \fIPATTERN\fR
 Highlight ASCII text or hex sequence (e.g. \fB\-S 'ELF'\fR or \fB\-S 0xfeedfacf\fR).
 .TP
-\fB\-\-inspect\fR \fIOFFSET\fR
-Decode u8/i8/u16/u32/u64/f32/f64/ULEB128/UTF-8 at \fIOFFSET\fR.
+\fB\-\-inspect\fR [\fI+-\fR]\fIOFFSET\fR
+Decode u8/i8/u16/u32/u64/i64/f32/f64/ULEB128/SLEB128/UTF-8 at \fIOFFSET\fR (repeatable).
+.TP
+\fB\-\-strings\fR[\fI=MIN_LEN\fR]
+Extract printable ASCII and graphic UTF-8 string literals (default >= 4 characters).
 .TP
 \fB\-i\fR, \fB\-\-include\fR [\fB\-\-lang\fR \fIL\fR]
-Emit source array in rust, c (default), go, python, or ts.
+Emit source array in rust, c (default), go, python, ts, zig, or csharp.
 .TP
 \fB\-r\fR, \fB\-\-reverse\fR
 Reverse hex dump (octet, xxd, hexdump \-C, or \-r \-p) back to binary.

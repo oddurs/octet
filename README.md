@@ -79,6 +79,10 @@ octet --classic firmware.bin
 # Highlight ASCII or hex patterns and inspect multi-type values at offset 0x98
 octet arm64_bin.macho -S "TEXT" --inspect 0x98
 
+# Extract printable ASCII & graphic UTF-8 strings (with encoding & null-termination tags)
+octet --strings firmware.bin
+octet --strings=8 -j firmware.bin
+
 # Side-by-side binary diff
 octet firmware_v1.bin --diff firmware_v2.bin
 
@@ -89,8 +93,9 @@ octet -j --inspect 0x98 arm64_bin.macho
 octet image.bin -s -64
 octet image.bin -s 4KiB -l 256
 
-# Generate source code arrays in Rust, C, Go, Python, or TypeScript
+# Generate source code arrays in Rust, C, Go, Python, TypeScript, Zig, or C#
 octet payload.bin -i --lang rust
+octet payload.bin -i --lang zig
 
 # Round-trip reverse (works on smart octet dumps, classic xxd, hexdump -C, or -r -p plain hex)
 octet payload.bin | octet -r > restored.bin

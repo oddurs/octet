@@ -395,7 +395,6 @@ fn render_header_banner(
     let t = &opts.theme;
     let c = opts.color;
     let top_bar = format!("╭{}╮", "─".repeat(inner_w));
-    let bot_bar = format!("╰{}╯", "─".repeat(inner_w));
 
     let _ = writeln!(out, "{}", t.paint(&top_bar, t.border, c));
 
@@ -448,10 +447,35 @@ fn render_header_banner(
         t.paint("│", t.border, c),
     );
 
-    let mid_bar = format!("├{}┤", "─".repeat(inner_w));
+    let core_w = compute_table_core_width(opts, off_w);
+    let cols = opts.cols.max(1);
+    let j1 = core_w.saturating_sub(cols + 3);
+    let j2 = core_w.saturating_sub(2);
+    let mid_bar = build_junction_bar('├', '┤', '┬', inner_w, &[j1, j2]);
+    let ruler_bot_bar = build_junction_bar('╰', '╯', '┴', inner_w, &[j1, j2]);
     let _ = writeln!(out, "{}", t.paint(&mid_bar, t.border, c));
     render_column_ruler_row(out, opts, width, off_w);
-    let _ = writeln!(out, "{}", t.paint(&bot_bar, t.border, c));
+    let _ = writeln!(out, "{}", t.paint(&ruler_bot_bar, t.border, c));
+}
+
+fn build_junction_bar(
+    left: char,
+    right: char,
+    junction: char,
+    inner_w: usize,
+    positions: &[usize],
+) -> String {
+    let mut s = String::with_capacity(inner_w * 3 + 6);
+    s.push(left);
+    for idx in 0..inner_w {
+        if positions.contains(&idx) {
+            s.push(junction);
+        } else {
+            s.push('─');
+        }
+    }
+    s.push(right);
+    s
 }
 
 fn render_column_ruler_row(
@@ -1228,6 +1252,14 @@ pub fn render_json_report(
             );
         } else {
             let _ = writeln!(out, "    \"uleb128\": null,");
+        }
+        if let Some((val, len)) = insp.sleb128 {
+            let _ = writeln!(
+                out,
+                "    \"sleb128\": {{ \"value\": {val}, \"bytes\": {len} }},"
+            );
+        } else {
+            let _ = writeln!(out, "    \"sleb128\": null,");
         }
         if let Some((ch, len)) = insp.utf8_char {
             let _ = writeln!(

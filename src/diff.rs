@@ -165,7 +165,6 @@ pub fn render_diff_ansi(
     let table_w = (off_w + 8) + 2 * side_w;
     let inner_w = table_w.saturating_sub(2);
     let top_bar = format!("╭{}╮", "─".repeat(inner_w));
-    let mid_bar = format!("├{}┤", "─".repeat(inner_w));
     let bot_bar = format!("╰{}╯", "─".repeat(inner_w));
 
     let _ = writeln!(out, "{}", theme.paint(&top_bar, theme.border, color));
@@ -187,14 +186,17 @@ pub fn render_diff_ansi(
         theme.paint_bold(&padded, theme.fg_primary, color),
         theme.paint("│", theme.border, color),
     );
-    let _ = writeln!(out, "{}", theme.paint(&mid_bar, theme.border, color));
-
     let off_hdr = format!(" {:<width$}", "OFFSET", width = off_w.saturating_sub(2));
     let left_hdr = pad_diff_cell(&format!("⊖ {left_short} ({} B)", report.left_len), side_w);
     let right_hdr = pad_diff_cell(
         &format!("⊕ {right_short} ({} B)", report.right_len),
         side_w.saturating_sub(1),
     );
+    let j1 = off_hdr.chars().count() + 1;
+    let j2 = j1 + 1 + 1 + side_w + 2;
+    let hdr_mid_bar = build_diff_junction_bar('├', '┤', '┬', inner_w, &[j1, j2]);
+    let hdr_bot_bar = build_diff_junction_bar('╰', '╯', '┴', inner_w, &[j1, j2]);
+    let _ = writeln!(out, "{}", theme.paint(&hdr_mid_bar, theme.border, color));
     let _ = writeln!(
         out,
         "{}{} {} {}  {}  {}{}",
@@ -206,7 +208,7 @@ pub fn render_diff_ansi(
         theme.paint_bold(&right_hdr, theme.diff_add, color),
         theme.paint("│", theme.border, color),
     );
-    let _ = writeln!(out, "{}", theme.paint(&bot_bar, theme.border, color));
+    let _ = writeln!(out, "{}", theme.paint(&hdr_bot_bar, theme.border, color));
 
     for row in &report.rows {
         match row {
@@ -263,6 +265,26 @@ pub fn render_diff_ansi(
     );
     let _ = writeln!(out, "{}", theme.paint(&bot_bar, theme.border, color));
     out
+}
+
+fn build_diff_junction_bar(
+    left: char,
+    right: char,
+    junction: char,
+    inner_w: usize,
+    positions: &[usize],
+) -> String {
+    let mut s = String::with_capacity(inner_w * 3 + 6);
+    s.push(left);
+    for idx in 0..inner_w {
+        if positions.contains(&idx) {
+            s.push(junction);
+        } else {
+            s.push('─');
+        }
+    }
+    s.push(right);
+    s
 }
 
 fn pad_diff_cell(s: &str, width: usize) -> String {

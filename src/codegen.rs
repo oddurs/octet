@@ -20,10 +20,15 @@ pub enum CodeLanguage {
     Python,
     /// TypeScript / JavaScript `export const DATA = new Uint8Array([...]);`.
     TypeScript,
+    /// Zig `pub const octet_data = [_]u8{ ... };`.
+    Zig,
+    /// C# `public static readonly byte[] OctetData = new byte[] { ... };`.
+    CSharp,
 }
 
 impl CodeLanguage {
-    /// Parses a language identifier string (`c`, `rust`, `rs`, `go`, `py`, `python`, `ts`, `js`).
+    /// Parses a language identifier string (`c`, `rust`, `rs`, `go`, `py`, `python`, `ts`, `js`,
+    /// `zig`, `cs`, `csharp`).
     pub fn parse(input: &str) -> Result<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
             "c" | "h" | "cpp" => Ok(Self::C),
@@ -31,8 +36,10 @@ impl CodeLanguage {
             "go" | "golang" => Ok(Self::Go),
             "py" | "python" => Ok(Self::Python),
             "ts" | "typescript" | "js" | "javascript" => Ok(Self::TypeScript),
+            "zig" => Ok(Self::Zig),
+            "cs" | "csharp" | "c#" => Ok(Self::CSharp),
             other => Err(Error::InvalidArgument(format!(
-                "unsupported codegen language '{other}' (expected: rust, c, go, python, ts)"
+                "unsupported codegen language '{other}' (expected: rust, c, go, python, ts, zig, csharp)"
             ))),
         }
     }
@@ -84,6 +91,19 @@ pub fn generate_code(
             let _ = writeln!(out, "export const {upper_ident} = new Uint8Array([");
             write_hex_grid(&mut out, data, cols, upper, false, "  ", false);
             let _ = writeln!(out, "]);");
+        }
+        CodeLanguage::Zig => {
+            let _ = writeln!(out, "pub const {base_ident} = [_]u8{{");
+            write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
+            let _ = writeln!(out, "}};");
+        }
+        CodeLanguage::CSharp => {
+            let _ = writeln!(
+                out,
+                "public static readonly byte[] {upper_ident} = new byte[] {{"
+            );
+            write_hex_grid(&mut out, data, cols, upper, false, "    ", false);
+            let _ = writeln!(out, "}};");
         }
     }
     out

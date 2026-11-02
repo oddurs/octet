@@ -7,9 +7,10 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use octet::{
-    FormatOptions, Theme, ValueInspection, ViewStyle, compute_diff, inspect_header,
-    parse_byte_count, render_ansi_to_svg, render_diff_ansi, render_diff_json, render_dump,
-    render_json_report, reverse_dump, slice_buffer, strip_ansi,
+    CodeLanguage, FormatOptions, Theme, ValueInspection, ViewStyle, compute_diff, extract_strings,
+    generate_code, inspect_header, parse_byte_count, render_ansi_to_svg, render_diff_ansi,
+    render_diff_json, render_dump, render_json_report, render_strings_ansi, render_strings_json,
+    reverse_dump, slice_buffer, strip_ansi,
 };
 
 #[test]
@@ -298,4 +299,108 @@ fn test_extended_magic_headers_and_json_report() {
     let man = Command::new(bin).arg("--man").output().expect("run --man");
     assert!(man.status.success());
     assert!(String::from_utf8_lossy(&man.stdout).contains(".TH OCTET 1"));
+}
+
+#[test]
+fn test_sleb128_strings_extraction_codegen_and_junctions() {
+    // 1. SLEB128 signed varint decoding (-1 = 0x7f, -624485 = [0x9b, 0xf1, 0x59], i64::MIN).
+    let neg_one = ValueInspection::at(&[0x7f], 0, 0).expect("inspect -1");
+    assert_eq!(neg_one.uleb128, Some((127, 1)));
+    assert_eq!(neg_one.sleb128, Some((-1, 1)));
+
+    let dwarf_neg = ValueInspection::at(&[0x9b, 0xf1, 0x59], 0, 0).expect("inspect -624485");
+    assert_eq!(dwarf_neg.sleb128, Some((-624_485, 3)));
+
+    // 10th byte SLEB128 overflow check: 0x02 in the 10th byte is invalid for signed 64-bit LEB128.
+    let mut sleb_overflow = [0x80_u8; 10];
+    sleb_overflow[9] = 0x02;
+    let insp_over = ValueInspection::at(&sleb_overflow, 0, 0).expect("inspect sleb overflow");
+    assert_eq!(insp_over.sleb128, None);
+
+    // 2. String extraction (`extract_strings`, `render_strings_ansi`, `render_strings_json`)
+    let payload = b"\x00\x00hello_world\x00\xff\xfeRust \xF0\x9F\xA6\x80 Engine\x00ab\x00";
+    let extracted = extract_strings(payload, 4, 0x1000);
+    assert_eq!(extracted.len(), 2);
+    assert_eq!(extracted[0].offset, 0x1002);
+    assert_eq!(extracted[0].text, "hello_world");
+    assert!(extracted[0].null_terminated);
+    assert!(!extracted[0].is_utf8_multibyte);
+
+    assert_eq!(extracted[1].offset, 0x1010);
+    assert_eq!(extracted[1].text, "Rust 🦀 Engine");
+    assert!(extracted[1].null_terminated);
+    assert!(extracted[1].is_utf8_multibyte);
+
+    let strings_ansi = render_strings_ansi(
+        &extracted,
+        payload.len(),
+        4,
+        Some("payload.bin"),
+        &Theme::dark(),
+        false,
+    );
+    assert!(strings_ansi.contains("STRING TABLE"));
+    assert!(strings_ansi.contains("ASCII\\0"));
+    assert!(strings_ansi.contains("UTF-8\\0"));
+    let strings_json = render_strings_json(&extracted, payload.len(), 4, Some("payload.bin"));
+    assert!(strings_json.contains("\"mode\": \"strings\""));
+    assert!(strings_json.contains("\"encoding\": \"utf8\""));
+
+    // 3. Zig and C# codegen languages
+    let zig_code = generate_code(
+        &[0xde, 0xad, 0xbe, 0xef],
+        Some("rom.bin"),
+        CodeLanguage::Zig,
+        8,
+        false,
+    );
+    assert!(zig_code.contains("pub const rom_bin = [_]u8{"));
+    let cs_code = generate_code(
+        &[0xde, 0xad, 0xbe, 0xef],
+        Some("rom.bin"),
+        CodeLanguage::CSharp,
+        8,
+        true,
+    );
+    assert!(cs_code.contains("public static readonly byte[] ROM_BIN = new byte[] {"));
+    assert!(cs_code.contains("0xDE, 0xAD, 0xBE, 0xEF,"));
+
+    // 4. Connected box-drawing junctions (`┬` and `┴`) align vertically with `│` in Smart & Diff views.
+    let smart = render_dump(
+        payload,
+        &FormatOptions {
+            color: false,
+            ..FormatOptions::default()
+        },
+    );
+    let smart_lines: Vec<Vec<char>> = smart.lines().map(|l| l.chars().collect()).collect();
+    // Line 3 is the `├...┬...┬...┤` divider, line 4 is the column ruler, line 5 is `╰...┴...┴...╯`.
+    for (col_idx, &ch) in smart_lines[3].iter().enumerate() {
+        if ch == '┬' {
+            assert_eq!(
+                smart_lines[4][col_idx], '│',
+                "expected vertical │ below ┬ at col {col_idx}"
+            );
+            assert_eq!(
+                smart_lines[5][col_idx], '┴',
+                "expected bottom ┴ below │ at col {col_idx}"
+            );
+        }
+    }
+
+    let diff_rep = compute_diff(payload, b"different_payload", 8, 0, true);
+    let diff_out = render_diff_ansi(&diff_rep, "a.bin", "b.bin", 8, &Theme::dark(), false);
+    let diff_lines: Vec<Vec<char>> = diff_out.lines().map(|l| l.chars().collect()).collect();
+    for (col_idx, &ch) in diff_lines[2].iter().enumerate() {
+        if ch == '┬' {
+            assert_eq!(
+                diff_lines[3][col_idx], '│',
+                "expected diff vertical │ below ┬ at col {col_idx}"
+            );
+            assert_eq!(
+                diff_lines[4][col_idx], '┴',
+                "expected diff bottom ┴ below │ at col {col_idx}"
+            );
+        }
+    }
 }
