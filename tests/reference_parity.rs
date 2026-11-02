@@ -27,14 +27,14 @@ fn run_with_stdin(bin: &str, args: &[&str], input: &[u8]) -> Vec<u8> {
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(err) = stdin.write_all(input) {
-            assert_eq!(
-                err.kind(),
-                std::io::ErrorKind::BrokenPipe,
-                "failed to write input to child stdin: {err}"
-            );
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(err) = stdin.write_all(input)
+    {
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "failed to write input to child stdin: {err}"
+        );
     }
 
     let output = child.wait_with_output().expect("failed to wait on child");

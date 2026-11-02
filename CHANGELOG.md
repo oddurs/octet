@@ -4,6 +4,8 @@ All notable changes to `octet` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.1.0] - 2026-11-01
 
 ### Added
@@ -24,3 +26,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Multi-language byte array code generation (`-i` / `--lang <rust|c|go|python|ts|zig|csharp>`).
   - Round-trip hex-to-binary reversal (`-r` / `--reverse`) across `octet`, `xxd`, `hexdump -C`, `-b` binary, and `-r -p` plain streams.
   - Structured RFC 8259 JSON report export (`-j` / `--json`), shell completions (`--completions <bash|zsh|fish>`), and troff manual page generation (`--man`).
+
+[Unreleased]: https://github.com/oddurs/octet/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/oddurs/octet/releases/tag/v0.1.0

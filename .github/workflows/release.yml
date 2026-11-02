@@ -43,7 +43,7 @@ jobs:
           staging="octet-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$staging/man" "$staging/completions"
           cp "target/${{ matrix.target }}/release/octet" "$staging/"
-          cp README.md LICENSE CHANGELOG.md "$staging/"
+          cp README.md LICENSE-MIT LICENSE-APACHE CHANGELOG.md "$staging/"
           cargo run --release -- --man > "$staging/man/octet.1"
           cargo run --release -- --completions bash > "$staging/completions/octet.bash"
           cargo run --release -- --completions zsh > "$staging/completions/_octet"

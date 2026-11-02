@@ -39,13 +39,37 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run unit, integration, and doc tests
-        run: cargo test
+        run: cargo test --locked
 
       - name: Build documentation
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --locked
 
-      - name: Verify crates.io package manifest
-        run: cargo package --list --allow-dirty
+      # Builds the crate from the packaged tarball, so a file missing from the
+      # package or an `exclude` that drops a needed source fails here, not on publish.
+      - name: Verify crates.io package
+        run: cargo package --locked
+
+  msrv:
+    name: MSRV (rust-version from Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read rust-version
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build and test on MSRV
+        run: cargo test --locked
