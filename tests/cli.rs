@@ -377,3 +377,23 @@ fn zero_columns_means_the_default_width() {
     // As in xxd, plain mode with zero columns is one unbroken line.
     assert_eq!(render(&["-p", "-c", "0"]).lines().count(), 1);
 }
+
+#[test]
+fn zero_length_prints_nothing_in_compatible_styles() {
+    let input = scratch_file("zero_length", "in.bin", b"hello world");
+    let render = |args: &[&str]| {
+        let out = octet().args(args).arg(&input).output().expect("run octet");
+        stdout_of(&out)
+    };
+    // hexdump -C prints the final offset after a seek past EOF...
+    assert_eq!(render(&["-C", "-s", "100"]), "0000000b\n");
+    // ...but nothing at all when asked for zero bytes, and xxd agrees.
+    for args in [
+        &["-C", "-s", "3", "-n", "0"][..],
+        &["-C", "-n", "0"],
+        &["--classic", "-s", "3", "-l", "0"],
+        &["-p", "-l", "0"],
+    ] {
+        assert_eq!(render(args), "", "{args:?}");
+    }
+}

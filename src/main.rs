@@ -402,7 +402,18 @@ fn run_cli(args: Vec<OsString>) -> Result<()> {
         return Ok(());
     }
 
-    let mut rendered = render_dump(sliced, &opts);
+    // Asked for zero bytes, hexdump and xxd print nothing, not even the final
+    // offset line that a seek past EOF still gets. render_dump sees an empty
+    // slice either way, so only the requested length can tell them apart.
+    let compatible_style = matches!(
+        cfg.style,
+        ViewStyle::Canonical | ViewStyle::Classic | ViewStyle::Plain
+    );
+    let mut rendered = if cfg.length == Some(0) && compatible_style {
+        String::new()
+    } else {
+        render_dump(sliced, &opts)
+    };
     for insp in &inspections {
         rendered.push_str(&insp.render_ansi(&cfg.theme, color));
     }
