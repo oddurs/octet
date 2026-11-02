@@ -8,6 +8,7 @@ use std::ops::Range;
 
 use crate::error::{Error, Result};
 use crate::theme::Theme;
+use crate::width::{pad_or_cut, str_width, take_width};
 
 /// Decoded numeric and text representations of bytes starting at a specific offset.
 #[derive(Debug, Clone)]
@@ -201,29 +202,24 @@ impl ValueInspection {
             );
         }
         if let Some(((ule, ile), (ube, ibe))) = self.int64 {
-            let le_str = if ile < 0 {
-                format!("{ile} (i64)")
-            } else {
-                format!("{ule}")
-            };
-            let be_str = if ibe < 0 {
-                format!("0x{ube:016x} ({ibe})")
-            } else {
-                format!("0x{ube:016x}")
-            };
-            let line = format!(
-                "   {:<16} : {:<26} {:<16} : {be_str}",
-                "u64 / i64 (LE)", le_str, "u64 / i64 (BE)",
-            );
-            write_card_row(
-                &mut out,
-                &line,
-                inner_w,
-                theme,
-                theme.fg_primary,
-                false,
-                color,
-            );
+            // One row per signedness: "u64 / i64" pairs reach 43 columns at the extremes,
+            // wider than either value column.
+            let rows = [
+                ("u64 (LE)", ule.to_string(), "u64 (BE)", ube.to_string()),
+                ("i64 (LE)", ile.to_string(), "i64 (BE)", ibe.to_string()),
+            ];
+            for (le_label, le_val, be_label, be_val) in rows {
+                let line = format!("   {le_label:<16} : {le_val:<26} {be_label:<16} : {be_val}");
+                write_card_row(
+                    &mut out,
+                    &line,
+                    inner_w,
+                    theme,
+                    theme.fg_primary,
+                    false,
+                    color,
+                );
+            }
         }
         if let Some((fle, fbe)) = self.float32 {
             let line = format!(
@@ -265,19 +261,22 @@ impl ValueInspection {
             Some((ch, clen)) => format!("U+{:04X} {:?} ({clen} B)", ch as u32, ch),
             None => String::from("Invalid UTF-8 lead"),
         };
-        let line = format!(
-            "   {:<16} : {:<26} {:<16} : {}",
-            "ULEB / SLEB128", leb_info, "UTF-8 Codepoint", utf8_info
-        );
-        write_card_row(
-            &mut out,
-            &line,
-            inner_w,
-            theme,
-            theme.fg_secondary,
-            false,
-            color,
-        );
+        // Each gets a full row: a ten-byte varint pair runs to 50 columns, and the codepoint
+        // is drawn at its terminal width, so neither fits a half-row column.
+        for line in [
+            format!("   {:<16} : {leb_info}", "ULEB / SLEB128"),
+            format!("   {:<16} : {utf8_info}", "UTF-8 Codepoint"),
+        ] {
+            write_card_row(
+                &mut out,
+                &line,
+                inner_w,
+                theme,
+                theme.fg_secondary,
+                false,
+                color,
+            );
+        }
         let _ = writeln!(out, "{}", theme.paint(&bot, theme.border, color));
         out
     }
@@ -292,12 +291,7 @@ fn write_card_row(
     bold: bool,
     color: bool,
 ) {
-    let count = text.chars().count();
-    let padded = if count >= inner_w {
-        text.chars().take(inner_w).collect::<String>()
-    } else {
-        format!("{text}{}", " ".repeat(inner_w - count))
-    };
+    let padded = pad_or_cut(text, inner_w);
     let styled = if bold {
         theme.paint_bold(&padded, fg, color)
     } else {
@@ -548,7 +542,6 @@ pub fn render_strings_ansi(
         return out;
     }
 
-    let lit_budget = card_w.saturating_sub(off_w + 2 + 6 + 2 + 8 + 4);
     for item in strings {
         let off_str = theme.format_offset(item.offset, off_w, false, color);
         let len_str = format!("{:>5}B", item.byte_len);
@@ -563,7 +556,10 @@ pub fn render_strings_ansi(
         } else {
             theme.byte_ascii
         };
-        let clipped_lit = clip_string_literal(&item.text, lit_budget);
+        // Offset, length, encoding, and the "▸ " marker; the length column widens past
+        // 99999 B, so measure rather than assume.
+        let prefix_w = off_w + 2 + str_width(&len_str) + 2 + str_width(enc_tag) + 2 + 2;
+        let clipped_lit = clip_string_literal(&item.text, card_w.saturating_sub(prefix_w));
         let _ = writeln!(
             out,
             "{off_str}  {}  {}  {} {}",
@@ -611,13 +607,13 @@ pub fn render_strings_json(
     out
 }
 
-fn clip_string_literal(s: &str, max_chars: usize) -> String {
-    let count = s.chars().count();
-    if count <= max_chars {
+/// Quotes `s`, clipping it with a trailing ellipsis so the result spans at most `max_cols`
+/// terminal columns.
+fn clip_string_literal(s: &str, max_cols: usize) -> String {
+    if str_width(s) + 2 <= max_cols {
         format!("\"{s}\"")
     } else {
-        let take = max_chars.saturating_sub(2);
-        let prefix: String = s.chars().take(take).collect();
+        let (prefix, _) = take_width(s, max_cols.saturating_sub(3));
         format!("\"{prefix}\"…")
     }
 }
@@ -638,4 +634,99 @@ fn escape_json_str(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::width::str_width;
+
+    fn line_widths(rendered: &str) -> Vec<usize> {
+        rendered.lines().map(str_width).collect()
+    }
+
+    #[test]
+    fn inspector_fits_the_widest_values_and_shows_u64_and_i64() {
+        // Display column of the second " : " in a two-column row: border, indent, label,
+        // separator, left value, gap, right label.
+        const RIGHT_SEPARATOR_COL: usize = 1 + 3 + 16 + 3 + 26 + 1 + 16;
+        let patterns: [[u8; 8]; 7] = [
+            [0x80, 0, 0, 0, 0, 0, 0, 0x80],
+            [0xff; 8],
+            [0x80, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0x80],
+            (-f64::MAX).to_be_bytes(),
+            f64::NAN.to_le_bytes(),
+            f64::NEG_INFINITY.to_be_bytes(),
+        ];
+        for bytes in patterns {
+            let insp = ValueInspection::at(&bytes, 0, 0xffff_ffff_ffff).expect("in range");
+            let rendered = insp.render_ansi(&Theme::dark(), false);
+            assert!(
+                line_widths(&rendered).iter().all(|&w| w == 106),
+                "{bytes:02x?}\n{rendered}"
+            );
+            let ((ule, ile), (ube, ibe)) = insp.int64.expect("eight bytes");
+            for value in [ule.to_string(), ube.to_string()] {
+                assert!(rendered.contains(&value), "u64 {value} missing\n{rendered}");
+            }
+            for value in [ile.to_string(), ibe.to_string()] {
+                assert!(rendered.contains(&value), "i64 {value} missing\n{rendered}");
+            }
+            for line in rendered.lines() {
+                if let Some((idx, _)) = line.match_indices(" : ").nth(1) {
+                    assert_eq!(
+                        str_width(&line[..idx]),
+                        RIGHT_SEPARATOR_COL,
+                        "left column overran in {line:?}"
+                    );
+                }
+            }
+        }
+        let rendered = ValueInspection::at(&(-f64::MAX).to_be_bytes(), 0, 0)
+            .expect("in range")
+            .render_ansi(&Theme::dark(), false);
+        assert!(rendered.contains("-1.797693135e308"), "{rendered}");
+        for (bytes, text) in [
+            (f64::NAN.to_le_bytes(), "NaN"),
+            (f64::NEG_INFINITY.to_be_bytes(), "-inf"),
+        ] {
+            let rendered = ValueInspection::at(&bytes, 0, 0)
+                .expect("in range")
+                .render_ansi(&Theme::dark(), false);
+            assert!(rendered.contains(text), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn inspector_card_keeps_its_border_after_a_wide_codepoint() {
+        for text in ["漢xyz", "😀abcdefgh", "e\u{301}"] {
+            let rendered = ValueInspection::at(text.as_bytes(), 0, 0)
+                .expect("in range")
+                .render_ansi(&Theme::dark(), false);
+            assert!(
+                line_widths(&rendered).iter().all(|&w| w == 106),
+                "{text}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn strings_table_stays_within_its_card() {
+        let mut data = "漢字テキスト 😀👍🏽 e\u{301} 한국어 ".repeat(8).into_bytes();
+        data.push(0);
+        for len in [70, 74, 75, 76, 77, 120] {
+            data.extend(std::iter::repeat_n(b'x', len));
+            data.push(0);
+        }
+        for (label, offset) in [("漢字漢字.bin", 0), ("plain.bin", 0x1_0000_0000)] {
+            let strings = extract_strings(&data, 4, offset);
+            let rendered =
+                render_strings_ansi(&strings, data.len(), 4, Some(label), &Theme::dark(), false);
+            let widths = line_widths(&rendered);
+            let card_w = widths[0];
+            assert!(widths[..5].iter().all(|&w| w == card_w), "{rendered}");
+            assert!(widths.iter().all(|&w| w <= card_w), "{rendered}");
+        }
+    }
 }
