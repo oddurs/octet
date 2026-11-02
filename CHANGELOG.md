@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-02
+
+### Fixed
+- **Data loss (regression in 0.1.1)**: `octet --strings 8 FILE` treated `8` as the input and overwrote `FILE` as the output. A word made only of digits after `--strings` is again the minimum length. octet now also refuses to run when OUTFILE is the same file as INFILE (hard links included), so a dump can never overwrite its own input.
+- **Hang (regression in 0.1.1)**: a negative `-s` on a device such as `/dev/zero` read forever. It now fails at once with "cannot seek".
+- **Memory and latency**: `--classic` (with every option), `-C`, `-p` and `-i` (all languages except Rust) stream in 64 KiB steps instead of reading the whole input and rendering the whole output first. On a 200 MB file, `--classic | head -1` went from 17 s / 1.5 GB to 0.02 s / 2 MB, and `--classic /dev/zero` no longer exhausts memory. `--diff` of two 200 MiB files went from 2.8 GB to 400 MB.
+- **Linux devices**: offsets on character devices are correct (`-s 0x100 /dev/zero` showed `00000000`), and `-s` works on `/proc` files, which report size 0.
+- **`-S` search**: the Smart view no longer slows quadratically with many matches. 1 MiB with `-S A` went from 5.9 s to 0.08 s.
+- **Card layout**: Smart cards stay aligned for every `-c`/`-g`/radix combination, 51 of which were misaligned. Wide (CJK, emoji) and zero-width characters are measured in terminal columns everywhere: banners, annotations, inspector, `--strings` and the `--diff` header.
+- **Inspector**: u64 and i64 are always shown in full, LE and BE. Extreme values such as `i64::MIN` were cut off.
+- **Header recognition**: no longer disabled by `-o`. It is still skipped when `-s` starts the view part-way into the file.
+- **Docs and tooling**: the `--diff` help example had old and new swapped. Bash completion no longer splits file names containing spaces. The man page passes `mandoc -T lint` and honours `SOURCE_DATE_EPOCH`. `-p` and `-i` accept more than 256 columns, as xxd does.
+
+### Changed
+- Smart and Compact views read at most 16 MiB of an input that is not a regular file (a pipe or device) unless `-l` is given, with a note on stderr. Regular files are always read in full.
+- Release archives now include static musl builds for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. They run on any Linux, while the gnu build needs glibc 2.34 or newer.
+
+### Added
+- Library: `stream_dump`, `stream_code` and `can_stream` for bounded-memory dumping from a reader to a writer, and `Diff` for planning a diff's shown rows in one pass.
+
 ## [0.1.1] - 2026-11-01
 
 ### Fixed
@@ -48,6 +68,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Round-trip hex-to-binary reversal (`-r` / `--reverse`) across `octet`, `xxd`, `hexdump -C`, `-b` binary, and `-r -p` plain streams.
   - Structured RFC 8259 JSON report export (`-j` / `--json`), shell completions (`--completions <bash|zsh|fish>`), and troff manual page generation (`--man`).
 
-[Unreleased]: https://github.com/oddurs/octet/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/oddurs/octet/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/oddurs/octet/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/oddurs/octet/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/oddurs/octet/releases/tag/v0.1.0
