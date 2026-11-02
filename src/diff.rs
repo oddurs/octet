@@ -150,8 +150,8 @@ pub fn render_diff_ansi(
 ) -> String {
     let cols = cols.max(4);
     let mut out = String::new();
-    let left_short = basename(left_label);
-    let right_short = basename(right_label);
+    let left_short = crate::format::neutralise_controls(basename(left_label));
+    let right_short = crate::format::neutralise_controls(basename(right_label));
     let max_off = report
         .rows
         .iter()

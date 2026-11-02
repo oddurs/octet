@@ -511,7 +511,7 @@ pub fn render_strings_ansi(
     let bot = format!("╰{}╯", "─".repeat(inner_w));
 
     let _ = writeln!(out, "{}", theme.paint(&top, theme.border, color));
-    let lbl = label.unwrap_or("stdin");
+    let lbl = crate::format::neutralise_controls(label.unwrap_or("stdin"));
     let hdr_plain = format!(
         " ◈ STRING TABLE · {lbl}  │  {} strings (min {min_chars} chars) in {total_bytes} B",
         strings.len()
